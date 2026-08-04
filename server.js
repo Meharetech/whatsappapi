@@ -69,6 +69,20 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+
+// Global middleware to prevent proxy (Nginx/Cloudflare) from stripping CORS headers on HTTP 500 errors
+app.use((req, res, next) => {
+  const originalStatus = res.status;
+  res.status = function (statusCode) {
+    if (statusCode === 500) {
+      console.log(`[CORS Patch] Overriding HTTP 500 to 400 for: ${req.method} ${req.originalUrl}`);
+      return originalStatus.call(this, 400);
+    }
+    return originalStatus.call(this, statusCode);
+  };
+  next();
+});
+
 app.use(express.json());
 
 app.get("/", (req, res) => {

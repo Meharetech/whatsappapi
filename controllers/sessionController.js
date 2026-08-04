@@ -107,7 +107,7 @@ export const deleteSession = async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -147,7 +147,7 @@ export const getSessionQR = async (req, res) => {
 
     res.json({ qr: qrCode, sessionId: id });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -168,7 +168,7 @@ export const reconnectSession = async (req, res) => {
 
     res.json({ success: true, status: result?.status || "connecting" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -196,7 +196,7 @@ export const getPairingCode = async (req, res) => {
     const code = await WhatsAppService.requestPairingCode(id, phoneNumber);
     res.json({ success: true, code });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -217,7 +217,7 @@ export const logoutSession = async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -237,7 +237,7 @@ export const getSessionGroups = async (req, res) => {
     const groups = await WhatsAppService.getGroups(id);
     res.json({ success: true, data: groups });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -257,7 +257,7 @@ export const getGroupMetadata = async (req, res) => {
     const metadata = await WhatsAppService.getGroupMetadata(id, groupId);
     res.json({ success: true, data: metadata });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -277,7 +277,7 @@ export const getGroupInviteLink = async (req, res) => {
     const link = await WhatsAppService.getGroupInviteLink(id, groupId);
     res.json({ success: true, link });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -359,7 +359,7 @@ export const createGroups = async (req, res) => {
       errors: errors.length > 0 ? errors : undefined,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 

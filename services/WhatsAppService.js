@@ -88,6 +88,32 @@ async function resolveGroupParticipantsLids(sock, participants) {
   }
 }
 
+async function waitForSocketOpenWithTimeout(sock, timeoutMs = 8000) {
+  if (!sock) {
+    throw new Error("Socket connection not found.");
+  }
+  if (sock.ws && sock.ws.readyState === 1) {
+    return;
+  }
+  if (typeof sock.waitForSocketOpen !== "function") {
+    return;
+  }
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error("Timeout waiting for WhatsApp connection. Please verify your phone is connected and active."));
+    }, timeoutMs);
+  });
+  try {
+    await Promise.race([
+      sock.waitForSocketOpen(),
+      timeoutPromise
+    ]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 class WhatsAppService {
   constructor() {
     this.sockets = new Map();
@@ -1195,7 +1221,7 @@ class WhatsAppService {
     }
 
     try {
-      await sock.waitForSocketOpen();
+      await waitForSocketOpenWithTimeout(sock);
       // Give a tiny grace period for noise handshake to complete
       await new Promise(resolve => setTimeout(resolve, 1500));
       
@@ -1215,7 +1241,7 @@ class WhatsAppService {
       throw new Error("Socket connection not found. Please reconnect the session.");
     }
     try {
-      await sock.waitForSocketOpen();
+      await waitForSocketOpenWithTimeout(sock);
       const group = await sock.groupCreate(subject, participants);
       
       if (group && group.id) {
@@ -1316,7 +1342,7 @@ class WhatsAppService {
       throw new Error("Socket connection not found. Please reconnect the session.");
     }
     try {
-      await sock.waitForSocketOpen();
+      await waitForSocketOpenWithTimeout(sock);
       const groups = await sock.groupFetchAllParticipating();
       const groupsArray = Object.values(groups || {});
 
@@ -1363,7 +1389,7 @@ class WhatsAppService {
       throw new Error("Socket connection not found. Please reconnect the session.");
     }
     try {
-      await sock.waitForSocketOpen();
+      await waitForSocketOpenWithTimeout(sock);
       const metadata = await sock.groupMetadata(groupId);
       if (metadata && metadata.participants) {
         await resolveGroupParticipantsLids(sock, metadata.participants);
@@ -1381,7 +1407,7 @@ class WhatsAppService {
       throw new Error("Socket connection not found. Please reconnect the session.");
     }
     try {
-      await sock.waitForSocketOpen();
+      await waitForSocketOpenWithTimeout(sock);
       const code = await sock.groupInviteCode(groupId);
       return `https://chat.whatsapp.com/${code}`;
     } catch (err) {
