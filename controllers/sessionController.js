@@ -267,7 +267,7 @@ export const getGroupInviteLink = async (req, res) => {
 
     const session = await WhatsAppSession.findOne({
       sessionId: id,
-      userId: req.user._id,
+       userId: req.user._id,
     });
 
     if (!session) {
@@ -276,6 +276,88 @@ export const getGroupInviteLink = async (req, res) => {
 
     const link = await WhatsAppService.getGroupInviteLink(id, groupId);
     res.json({ success: true, link });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const createGroups = async (req, res) => {
+  try {
+    const { id } = req.params;
+    let { 
+      subjects, 
+      participants, 
+      editGroupSettings, 
+      sendNewMessages, 
+      addOtherMembers, 
+      sendMessageHistory, 
+      inviteViaLink, 
+      approveNewMembers 
+    } = req.body;
+
+    const session = await WhatsAppSession.findOne({
+      sessionId: id,
+      userId: req.user._id,
+    });
+
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    if (!subjects || (Array.isArray(subjects) && subjects.length === 0)) {
+      return res.status(400).json({ error: "At least one group subject is required" });
+    }
+
+    if (!Array.isArray(subjects)) {
+      subjects = [subjects];
+    }
+
+    let participantJids = [];
+    if (participants) {
+      const parts = Array.isArray(participants)
+        ? participants
+        : String(participants).split(",").map(p => p.trim()).filter(Boolean);
+
+      participantJids = parts.map(p => {
+        const clean = p.replace(/\D/g, "");
+        return clean ? `${clean}@s.whatsapp.net` : null;
+      }).filter(Boolean);
+    }
+
+    const options = {
+      editGroupSettings: editGroupSettings !== false,
+      sendNewMessages: sendNewMessages !== false,
+      memberAddMode: addOtherMembers === false ? "admin_add" : "all_member_add",
+      joinApprovalMode: approveNewMembers === true ? "on" : "off",
+      sendMessageHistory: sendMessageHistory !== false,
+      inviteViaLink: inviteViaLink !== false,
+    };
+
+    const createdGroups = [];
+    const errors = [];
+
+    for (const subject of subjects) {
+      try {
+        const group = await WhatsAppService.createGroup(id, subject.trim(), participantJids, options);
+        createdGroups.push({
+          subject,
+          id: group.id,
+          participants: group.participants,
+        });
+      } catch (err) {
+        console.error(`Failed to create group ${subject}:`, err.message);
+        errors.push({
+          subject,
+          error: err.message,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      created: createdGroups,
+      errors: errors.length > 0 ? errors : undefined,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -293,5 +375,6 @@ export default {
   getSessionGroups,
   getGroupMetadata,
   getGroupInviteLink,
+  createGroups,
 };
 

@@ -1,4 +1,5 @@
 import admin from "firebase-admin";
+import axios from "axios";
 
 let firebaseApp = null;
 
@@ -53,29 +54,30 @@ const verifyFirebaseIdTokenViaRest = async (idToken) => {
     );
   }
 
-  const response = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ idToken }),
-    },
-  );
+  try {
+    const response = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
+      { idToken },
+      { headers: { "Content-Type": "application/json" } }
+    );
 
-  const data = await response.json();
-  if (!response.ok || !Array.isArray(data?.users) || data.users.length === 0) {
-    const reason = data?.error?.message || "Unable to validate Firebase token";
+    const data = response.data;
+    if (!Array.isArray(data?.users) || data.users.length === 0) {
+      throw new Error("Unable to validate Firebase token: Profile not found");
+    }
+
+    const profile = data.users[0];
+    return {
+      uid: profile.localId,
+      email: profile.email,
+      email_verified: !!profile.emailVerified,
+      name: profile.displayName || "",
+      picture: profile.photoUrl || "",
+    };
+  } catch (err) {
+    const reason = err.response?.data?.error?.message || err.message || "Unable to validate Firebase token";
     throw new Error(`Firebase REST verification failed: ${reason}`);
   }
-
-  const profile = data.users[0];
-  return {
-    uid: profile.localId,
-    email: profile.email,
-    email_verified: !!profile.emailVerified,
-    name: profile.displayName || "",
-    picture: profile.photoUrl || "",
-  };
 };
 
 export const verifyFirebaseIdToken = async (idToken) => {
@@ -100,43 +102,44 @@ export const isFirebaseEmailPasswordVerified = async (email, password) => {
     };
   }
 
-  const signInResponse = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    },
-  );
+  try {
+    const signInResponse = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
+      { email, password, returnSecureToken: true },
+      { headers: { "Content-Type": "application/json" } }
+    );
 
-  const signInData = await signInResponse.json();
-  if (!signInResponse.ok || !signInData?.idToken) {
+    const signInData = signInResponse.data;
+    if (!signInData?.idToken) {
+      return {
+        verified: false,
+        reason: "Unable to sign in with Firebase: missing ID token",
+      };
+    }
+
+    const lookupResponse = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
+      { idToken: signInData.idToken },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    const lookupData = lookupResponse.data;
+    if (!Array.isArray(lookupData?.users) || lookupData.users.length === 0) {
+      return {
+        verified: false,
+        reason: "Unable to fetch Firebase user profile",
+      };
+    }
+
+    const profile = lookupData.users[0];
+    return { verified: !!profile?.emailVerified };
+  } catch (err) {
+    const reason = err.response?.data?.error?.message || err.message || "Firebase REST request failed";
     return {
       verified: false,
-      reason: signInData?.error?.message || "Unable to sign in with Firebase",
+      reason,
     };
   }
-
-  const lookupResponse = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ idToken: signInData.idToken }),
-    },
-  );
-
-  const lookupData = await lookupResponse.json();
-  if (!lookupResponse.ok || !Array.isArray(lookupData?.users)) {
-    return {
-      verified: false,
-      reason:
-        lookupData?.error?.message || "Unable to fetch Firebase user profile",
-    };
-  }
-
-  const profile = lookupData.users[0];
-  return { verified: !!profile?.emailVerified };
 };
 
 export default {

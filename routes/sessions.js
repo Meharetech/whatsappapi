@@ -14,6 +14,7 @@ router.post("/:id/logout", authMiddleware, sessionController.logoutSession);
 router.post("/:id/pairing-code", authMiddleware, sessionController.getPairingCode);
 router.post("/:id/reconnect", authMiddleware, sessionController.reconnectSession);
 router.get("/:id/groups", authMiddleware, sessionController.getSessionGroups);
+router.post("/:id/groups/create", authMiddleware, sessionController.createGroups);
 router.get("/:id/groups/:groupId", authMiddleware, sessionController.getGroupMetadata);
 router.get("/:id/groups/:groupId/invite-link", authMiddleware, sessionController.getGroupInviteLink);
 

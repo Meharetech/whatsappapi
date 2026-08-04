@@ -1208,6 +1208,108 @@ class WhatsAppService {
     }
   }
 
+  async createGroup(sessionId, subject, participants = [], options = {}) {
+    console.log(`[WA GROUPS] createGroup requested for sessionId: "${sessionId}". Active socket keys in memory:`, Array.from(this.sockets.keys()));
+    const sock = this.sockets.get(sessionId);
+    if (!sock) {
+      throw new Error("Socket connection not found. Please reconnect the session.");
+    }
+    try {
+      await sock.waitForSocketOpen();
+      const group = await sock.groupCreate(subject, participants);
+      
+      if (group && group.id) {
+        // 1. Edit Group Settings (locked = only admins, unlocked = all members)
+        if (options.editGroupSettings !== undefined) {
+          const restrictMode = options.editGroupSettings === false ? 'locked' : 'unlocked';
+          console.log(`[WA GROUPS] Setting restrictMode for group ${group.id} to ${restrictMode}`);
+          await sock.groupSettingUpdate(group.id, restrictMode).catch(err => {
+            console.error(`Failed to set restrictMode for group ${group.id}:`, err);
+          });
+        }
+
+        // 2. Send New Messages (announcement = only admins, not_announcement = all members)
+        if (options.sendNewMessages !== undefined) {
+          const announceMode = options.sendNewMessages === false ? 'announcement' : 'not_announcement';
+          console.log(`[WA GROUPS] Setting announceMode for group ${group.id} to ${announceMode}`);
+          await sock.groupSettingUpdate(group.id, announceMode).catch(err => {
+            console.error(`Failed to set announceMode for group ${group.id}:`, err);
+          });
+        }
+
+        // 3. Add Other Members (admin_add = only admins, all_member_add = all members)
+        if (options.memberAddMode) {
+          console.log(`[WA GROUPS] Setting memberAddMode for group ${group.id} to ${options.memberAddMode}`);
+          await sock.groupMemberAddMode(group.id, options.memberAddMode).catch(err => {
+            console.error(`Failed to set memberAddMode for group ${group.id}:`, err);
+          });
+        }
+
+        // 4. Approve New Members (on = admin approval required, off = open)
+        if (options.joinApprovalMode) {
+          console.log(`[WA GROUPS] Setting joinApprovalMode for group ${group.id} to ${options.joinApprovalMode}`);
+          await sock.groupJoinApprovalMode(group.id, options.joinApprovalMode).catch(err => {
+            console.error(`Failed to set joinApprovalMode for group ${group.id}:`, err);
+          });
+        }
+
+        // 5. Send Message History (optional custom node query)
+        if (options.sendMessageHistory !== undefined) {
+          const historyMode = options.sendMessageHistory === false ? 'off' : 'on';
+          console.log(`[WA GROUPS] Setting sendMessageHistory for group ${group.id} to ${historyMode}`);
+          try {
+            await sock.query({
+              tag: 'iq',
+              attrs: {
+                type: 'set',
+                xmlns: 'w:g2',
+                to: group.id
+              },
+              content: [
+                {
+                  tag: 'member_history_sharing',
+                  attrs: {},
+                  content: [{ tag: 'history_sharing', attrs: { state: historyMode } }]
+                }
+              ]
+            });
+          } catch (err) {
+            console.warn(`[WA GROUPS] Custom history_sharing query not supported by server:`, err.message);
+          }
+        }
+
+        // 6. Invite via Link (optional custom node query)
+        if (options.inviteViaLink !== undefined) {
+          const inviteMode = options.inviteViaLink === false ? 'off' : 'on';
+          console.log(`[WA GROUPS] Setting inviteViaLink for group ${group.id} to ${inviteMode}`);
+          try {
+            await sock.query({
+              tag: 'iq',
+              attrs: {
+                type: 'set',
+                xmlns: 'w:g2',
+                to: group.id
+              },
+              content: [
+                {
+                  tag: 'allow_member_invite_links',
+                  attrs: { enabled: inviteMode }
+                }
+              ]
+            });
+          } catch (err) {
+            // Silently fall back if the server or Baileys doesn't support the raw node
+          }
+        }
+      }
+      
+      return group;
+    } catch (err) {
+      console.error(`[WA GROUPS] Failed to create group "${subject}":`, err);
+      throw new Error(`Failed to create group "${subject}": ` + err.message);
+    }
+  }
+
   async getGroups(sessionId) {
     const sock = this.sockets.get(sessionId);
     if (!sock) {
