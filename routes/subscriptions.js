@@ -4,6 +4,9 @@ import subscriptionController from "../controllers/subscriptionController.js";
 
 const router = express.Router();
 
+// Public Plans for Landing Page & Visitors (No Auth Required)
+router.get("/public-plans", subscriptionController.getPublicPlans);
+
 router.get("/me", authMiddleware, subscriptionController.getMySubscription);
 router.get("/plans", authMiddleware, subscriptionController.getAvailablePlans);
 router.post("/switch", authMiddleware, subscriptionController.switchMyPlan);
@@ -44,6 +47,11 @@ router.post(
   "/admin/assign",
   authMiddleware,
   subscriptionController.assignPlanToUser,
+);
+router.post(
+  "/admin/adjust-user",
+  authMiddleware,
+  subscriptionController.adjustUserSubscription,
 );
 router.get(
   "/admin/users-usage",

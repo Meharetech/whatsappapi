@@ -3,7 +3,6 @@ import GoogleReview from "../models/GoogleReview.js";
 import GoogleOAuthSettings from "../../models/GoogleOAuthSettings.js";
 import UserGoogleConnection from "../../models/UserGoogleConnection.js";
 import axios from "axios";
-import jwt from "jsonwebtoken";
 
 const GOOGLE_PLACES_API_BASE = "https://maps.googleapis.com/maps/api/place";
 const GOOGLE_OAUTH_AUTHORIZE_URL =
@@ -15,7 +14,6 @@ const GOOGLE_ACCOUNT_MANAGEMENT_API =
   "https://mybusinessaccountmanagement.googleapis.com/v1";
 const GOOGLE_BUSINESS_INFO_API =
   "https://mybusinessbusinessinformation.googleapis.com/v1";
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-key";
 const FRONTEND_ORIGIN = (
   process.env.FRONTEND_URL || "http://localhost:5173"
 ).replace(/\/$/, "");

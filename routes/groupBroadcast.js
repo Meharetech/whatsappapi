@@ -55,6 +55,15 @@ router.post(
         return res.status(400).json({ error: "groupJids must be a valid JSON array" });
       }
 
+      let targetGroups = [];
+      try {
+        if (req.body.targetGroups) {
+          targetGroups = typeof req.body.targetGroups === "string" ? JSON.parse(req.body.targetGroups) : req.body.targetGroups;
+        }
+      } catch (e) {
+        console.warn("[GroupBroadcast Save Route] Could not parse targetGroups JSON:", e.message);
+      }
+
       if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
       if (!groupJids?.length) return res.status(400).json({ error: "At least one group must be selected" });
       if (!message?.trim() && !req.file) return res.status(400).json({ error: "Message or media file is required" });
@@ -74,10 +83,15 @@ router.post(
         }
       }
 
+      const totalMembers = Array.isArray(targetGroups)
+        ? targetGroups.reduce((sum, g) => sum + (Number(g.memberCount) || 0), 0)
+        : 0;
+
       const campaign = await GroupBroadcast.create({
         userId,
         sessionId,
         groupJids,
+        targetGroups,
         message: message || "",
         mediaUrl,
         mediaName,
@@ -90,7 +104,10 @@ router.post(
         stats: {
           total: groupJids.length,
           sent: 0,
-          failed: 0
+          failed: 0,
+          totalMembers,
+          sentMembers: 0,
+          failedMembers: 0
         }
       });
 

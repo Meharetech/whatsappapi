@@ -2,6 +2,7 @@ import InstagramSession from "../instagram/models/InstagramSession.js";
 import InstagramProcessedComment from "../instagram/models/InstagramProcessedComment.js";
 import InstagramAiAgent from "../instagram/models/InstagramAiAgent.js";
 import { generateAndPostReply } from "../instagram/controllers/instagramAiAgentController.js";
+import MetaSystemSettings from "../meta/models/MetaSystemSettings.js";
 
 // GET /api/webhook - verification for Meta
 export async function verifyWebhook(req, res) {
@@ -10,10 +11,13 @@ export async function verifyWebhook(req, res) {
     const token = req.query["hub.verify_token"] || req.query["verify_token"];
     const challenge = req.query["hub.challenge"] || req.query["challenge"];
 
-    if (
-      mode === "subscribe" &&
-      token === process.env.META_WEBHOOK_VERIFY_TOKEN
-    ) {
+    const settings = await MetaSystemSettings.getSingleton().catch(() => null);
+    const expectedToken =
+      settings?.webhookVerifyToken ||
+      process.env.META_WEBHOOK_VERIFY_TOKEN ||
+      "whatsapp_saas_verify_token_2024";
+
+    if (mode === "subscribe" && token === expectedToken) {
       return res.status(200).send(challenge);
     }
 

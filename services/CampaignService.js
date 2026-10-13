@@ -1,7 +1,8 @@
 import WhatsAppService from "./WhatsAppService.js";
-import { WhatsAppSession, Message, Campaign } from "../models/index.js";
+import { WhatsAppSession, Message, Campaign, WaChat, WaChatMessage } from "../models/index.js";
 import mongoose from "mongoose";
 import SubscriptionService from "./SubscriptionService.js";
+
 
 class CampaignService {
   constructor() {
@@ -324,6 +325,7 @@ class CampaignService {
     contactName = "",
     mediaPath = null,
     mediaType = null,
+    quotedOptions = null,
   ) {
     const session = await this.findUserSession(userId, sessionId);
 
@@ -344,11 +346,17 @@ class CampaignService {
       if (jid.length === 10) jid = "91" + jid;
     }
 
+    const isImage = mediaType?.startsWith("image");
+    const isVideo = mediaType?.startsWith("video");
+    const defaultMediaText = isImage ? "📷 Photo" : isVideo ? "🎥 Video" : "📎 Attachment";
+
     const msgDoc = new Message({
       sessionId: session._id,
       phoneNumber: jid,
       contactName,
-      message,
+      message: message || (mediaPath ? defaultMediaText : ""),
+      mediaUrl: mediaPath || null,
+      mediaType: mediaType || null,
       messageType: "single",
       status: "pending",
     });
@@ -356,27 +364,111 @@ class CampaignService {
     try {
       await SubscriptionService.assertMessageQuota({ _id: userId }, 1);
 
-      // Send message with optional media
-      await WhatsAppService.sendMessage(
+      // Send message with optional media and quoted options
+      const sendResult = await WhatsAppService.sendMessage(
         session.sessionId,
         jid,
-        message,
+        message || "",
         mediaPath,
         mediaType,
+        quotedOptions || {},
       );
 
       await SubscriptionService.consumeMessageQuota(userId, 1);
 
+      const actualMessageId = sendResult?.key?.id || `msg_${msgDoc._id}`;
+      msgDoc.messageId = actualMessageId;
       msgDoc.status = "sent";
       msgDoc.sentAt = new Date();
       await msgDoc.save();
 
+      // Sync outgoing message to WaChatMessage and WaChat table for live inbox
+      let chatJid = String(jid).includes("@") ? jid : `${jid}@s.whatsapp.net`;
+      if (!chatJid.endsWith("@g.us")) {
+        chatJid = chatJid.replace(/:\d+@/, "@").replace(/@c\.us$/, "@s.whatsapp.net");
+      }
+      const isGroup = chatJid.endsWith("@g.us");
+
+      let relativeMediaUrl = mediaPath;
+      if (relativeMediaUrl && typeof relativeMediaUrl === "string" && relativeMediaUrl.includes("uploads")) {
+        const filename = relativeMediaUrl.split(/[/\\]/).pop();
+        relativeMediaUrl = `/uploads/${filename}`;
+      }
+
+      let savedWaMsg = null;
+      try {
+        savedWaMsg = await WaChatMessage.findOneAndUpdate(
+          { sessionId: session.sessionId, messageId: actualMessageId },
+          {
+            $set: {
+              userId,
+              sessionId: session.sessionId,
+              chatJid,
+              messageId: actualMessageId,
+              text: message || (mediaPath ? defaultMediaText : ""),
+              direction: "out",
+              mediaType: mediaType
+                ? mediaType.startsWith("image")
+                  ? "image"
+                  : mediaType.startsWith("video")
+                    ? "video"
+                    : "document"
+                : null,
+              mediaUrl: relativeMediaUrl || null,
+              ...(quotedOptions?.quotedMessageDoc ? { quotedMessage: quotedOptions.quotedMessageDoc } : {}),
+            },
+            $setOnInsert: {
+              status: "sent",
+              timestamp: msgDoc.sentAt || new Date(),
+            }
+          },
+          { upsert: true, new: true }
+        );
+
+        await WaChat.findOneAndUpdate(
+          { userId, sessionId: session.sessionId, chatJid },
+          {
+            $set: {
+              lastMessage: message || (mediaType ? `[${mediaType}]` : ""),
+              lastMessageTime: msgDoc.sentAt || new Date(),
+              isGroup,
+            },
+            $setOnInsert: {
+              phoneNumber: chatJid.replace(/@.*/, ""),
+              name: contactName || (isGroup ? "WhatsApp Group" : ""),
+              contactName: contactName || "",
+              unreadCount: 0,
+            },
+          },
+          { upsert: true }
+        );
+
+        // Realtime Socket.IO emission to web inbox
+        const ioInstance = this.io || WhatsAppService.io;
+        if (ioInstance) {
+          const socketPayload = {
+            sessionId: session.sessionId,
+            chatJid,
+            from: chatJid.replace(/@.*/, ""),
+            message: savedWaMsg,
+          };
+          ioInstance.to(session.sessionId).emit("chat:message", socketPayload);
+          if (userId) {
+            ioInstance.to(`user:${userId.toString()}`).emit("chat:message", socketPayload);
+          }
+        }
+      } catch (waSyncErr) {
+        console.error("[CAMPAIGN WA SYNC] Warning:", waSyncErr.message);
+      }
+
       return {
         success: true,
-        messageId: `msg_${msgDoc._id}`,
+        messageId: actualMessageId,
+        key: sendResult?.key || { id: actualMessageId },
         to: jid,
         status: "sent",
         timestamp: msgDoc.sentAt.toISOString(),
+        savedWaMsg,
       };
     } catch (err) {
       msgDoc.status = "failed";
@@ -385,6 +477,7 @@ class CampaignService {
 
       throw err;
     }
+
   }
 }
 

@@ -9,11 +9,11 @@ export async function verifyWebhook(req, res) {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  const settings = await MetaSystemSettings.getSingleton();
+  const settings = await MetaSystemSettings.getSingleton().catch(() => null);
   const verifyToken =
-    settings.webhookVerifyToken ||
+    settings?.webhookVerifyToken ||
     process.env.META_WEBHOOK_VERIFY_TOKEN ||
-    "whatsapp_saas_verify";
+    "whatsapp_saas_verify_token_2024";
 
   if (mode === "subscribe" && token === verifyToken) {
     console.log("[Webhook] Verified");

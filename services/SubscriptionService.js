@@ -147,7 +147,7 @@ class SubscriptionService {
     for (const plan of DEFAULT_PLANS) {
       await SubscriptionPlan.updateOne(
         { slug: plan.slug },
-        { $setOnInsert: plan, $set: { "limits.sessions": -1 } },
+        { $setOnInsert: plan },
         { upsert: true },
       );
     }
@@ -160,7 +160,8 @@ class SubscriptionService {
       {
         $setOnInsert: {
           demoEnabled: true,
-          demoDurationDays: 7,
+          demoDurationDays: 3,
+          defaultTrialDays: 3,
           demoPlanId: demoPlan?._id || null,
           allowUserPlanSwitch: true,
         },
@@ -206,8 +207,8 @@ class SubscriptionService {
     if (settings?.demoEnabled && settings?.demoPlanId) {
       selectedPlan = await SubscriptionPlan.findById(settings.demoPlanId);
       status = "trial";
-      // Trial licence for registered user has unlimited time period (never expires)
-      expiresAt = null;
+      const trialDays = Math.max(Number(settings.defaultTrialDays || settings.demoDurationDays) || 3, 1);
+      expiresAt = new Date(Date.now() + trialDays * 24 * 60 * 60 * 1000);
     }
 
     if (!selectedPlan) {
@@ -221,12 +222,18 @@ class SubscriptionService {
       throw new Error("No active subscription plan available");
     }
 
+    if (!expiresAt && (selectedPlan.isDemo || status === "trial")) {
+      const trialDays = Math.max(Number(settings?.defaultTrialDays || settings?.demoDurationDays) || 3, 1);
+      expiresAt = new Date(Date.now() + trialDays * 24 * 60 * 60 * 1000);
+    }
+
     sub = await UserSubscription.create({
       userId: user._id,
       planId: selectedPlan._id,
       status,
       startedAt: new Date(),
       expiresAt,
+      trialUsed: status === "trial" || selectedPlan.isDemo,
       location: user.location || "",
       usage: {
         sessions: 0,
@@ -244,6 +251,33 @@ class SubscriptionService {
       },
     });
 
+    return UserSubscription.findById(sub._id).populate("planId");
+  }
+
+  async adjustUserSubscriptionDays(userId, { daysDelta, customExpiresAt, planId, status } = {}) {
+    let sub = await this.getUserSubscription(userId);
+    if (!sub) throw new Error("User subscription not found");
+
+    if (planId && String(planId) !== String(sub.planId?._id)) {
+      sub = await this.assignPlanToUser(userId, planId);
+    }
+
+    if (customExpiresAt) {
+      sub.expiresAt = new Date(customExpiresAt);
+    } else if (daysDelta !== undefined && daysDelta !== null) {
+      const currentExpiry = sub.expiresAt && new Date(sub.expiresAt) > new Date()
+        ? new Date(sub.expiresAt)
+        : new Date();
+      sub.expiresAt = new Date(currentExpiry.getTime() + Number(daysDelta) * 24 * 60 * 60 * 1000);
+    }
+
+    if (status) {
+      sub.status = status;
+    } else if (sub.expiresAt && sub.expiresAt > new Date() && sub.status === "expired") {
+      sub.status = "active";
+    }
+
+    await sub.save();
     return UserSubscription.findById(sub._id).populate("planId");
   }
 
@@ -307,6 +341,15 @@ class SubscriptionService {
     const monthCount =
       usageMessages.monthKey === keys.monthKey ? usageMessages.monthCount : 0;
 
+    let expiresAt = sub.expiresAt;
+    if (!expiresAt && plan) {
+      const durationDays = Number(plan.durationDays) || (plan.isDemo ? 3 : 30);
+      const start = sub.startedAt ? new Date(sub.startedAt) : new Date();
+      expiresAt = new Date(start.getTime() + durationDays * 24 * 60 * 60 * 1000);
+      sub.expiresAt = expiresAt;
+      await sub.save().catch(() => {});
+    }
+
     return {
       plan: {
         id: plan._id,
@@ -314,6 +357,7 @@ class SubscriptionService {
         name: plan.name,
         slug: plan.slug,
         isDemo: plan.isDemo,
+        durationDays: plan.durationDays,
         priceMonthly: plan.priceMonthly,
         priceYearly: plan.priceYearly,
         limits: plan.limits,
@@ -322,7 +366,8 @@ class SubscriptionService {
       subscription: {
         status: sub.status,
         startedAt: sub.startedAt,
-        expiresAt: sub.expiresAt,
+        expiresAt: expiresAt,
+        trialUsed: Boolean(sub.trialUsed || sub.status === "trial" || plan?.isDemo),
       },
       usage: {
         sessions: sub.usage.sessions || 0,
@@ -353,6 +398,21 @@ class SubscriptionService {
     const sub = await this.getUserSubscription(user?._id || user);
     if (!sub?.planId) {
       throw new Error("Subscription plan not found");
+    }
+
+    const isExpired = sub.status === "expired" || 
+      sub.status === "cancelled" || 
+      (sub.expiresAt && new Date(sub.expiresAt).getTime() < Date.now());
+
+    if (isExpired) {
+      if (sub.status !== "expired") {
+        sub.status = "expired";
+        await sub.save().catch(() => {});
+      }
+      throw new LimitError("Your subscription plan has expired. Please upgrade to continue.", {
+        reason: "subscription_expired",
+        subscription: sub,
+      });
     }
 
     if (!this.isFeatureEnabled(sub.planId, featureKey)) {
@@ -390,18 +450,19 @@ class SubscriptionService {
     const summary = await this.getUsageSummary(user._id);
     const { plan, subscription, usage } = summary;
 
-    if (resourceKey === "sessions") {
-      return summary;
-    }
+    const isExpired = subscription.status === "expired" ||
+      subscription.status === "cancelled" ||
+      (subscription.expiresAt && new Date(subscription.expiresAt).getTime() < Date.now());
 
-    if (
-      subscription.status === "expired" ||
-      subscription.status === "cancelled"
-    ) {
-      throw new LimitError("Subscription expired. Please upgrade your plan.", {
+    if (isExpired) {
+      throw new LimitError("Your subscription plan has expired. Please upgrade your plan.", {
         reason: "subscription_expired",
         subscription,
       });
+    }
+
+    if (resourceKey === "sessions") {
+      return summary;
     }
 
     const map = {
@@ -447,6 +508,10 @@ class SubscriptionService {
     }
 
     return summary;
+  }
+
+  async assertContactsLimit(user, count = 1) {
+    return this.assertResourceLimit(user, "numberLists", 1);
   }
 
   async assertStorageLimit(user, incomingBytes = 0) {
@@ -602,6 +667,9 @@ class SubscriptionService {
     const sub = await this.getUserSubscription(userId);
     sub.planId = plan._id;
     sub.status = plan.isDemo ? "trial" : "active";
+    if (plan.isDemo || sub.status === "trial") {
+      sub.trialUsed = true;
+    }
     sub.startedAt = start;
     sub.expiresAt =
       durationDays > 0

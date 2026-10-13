@@ -13,6 +13,13 @@ const groupBroadcastSchema = new mongoose.Schema({
   groupJids: [{
     type: String,
   }],
+  targetGroups: [
+    {
+      jid: String,
+      groupName: String,
+      memberCount: { type: Number, default: 0 }
+    }
+  ],
   message: {
     type: String,
   },
@@ -50,12 +57,16 @@ const groupBroadcastSchema = new mongoose.Schema({
   stats: {
     total: { type: Number, default: 0 },
     sent: { type: Number, default: 0 },
-    failed: { type: Number, default: 0 }
+    failed: { type: Number, default: 0 },
+    totalMembers: { type: Number, default: 0 },
+    sentMembers: { type: Number, default: 0 },
+    failedMembers: { type: Number, default: 0 }
   },
   results: [
     {
       jid: String,
       groupName: String,
+      memberCount: { type: Number, default: 0 },
       status: String,
       error: String
     }

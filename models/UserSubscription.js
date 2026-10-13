@@ -45,6 +45,7 @@ const userSubscriptionSchema = new mongoose.Schema(
     },
     startedAt: { type: Date, default: Date.now },
     expiresAt: { type: Date, default: null },
+    trialUsed: { type: Boolean, default: false },
     location: { type: String, default: "" },
     usage: { type: usageSnapshotSchema, default: () => ({}) },
   },

@@ -43,6 +43,19 @@ const whatsAppSessionSchema = new mongoose.Schema(
       default: null,
       select: false,
     },
+    groupSyncStatus: {
+      type: String,
+      enum: ["pending", "syncing", "completed", "failed"],
+      default: "pending",
+    },
+    groupsCount: {
+      type: Number,
+      default: 0,
+    },
+    lastGroupSyncAt: {
+      type: Date,
+      default: null,
+    },
   },
   {
     timestamps: true,
@@ -50,5 +63,7 @@ const whatsAppSessionSchema = new mongoose.Schema(
 );
 
 whatsAppSessionSchema.index({ userId: 1, sessionId: 1 });
+whatsAppSessionSchema.index({ status: 1 });
+whatsAppSessionSchema.index({ userId: 1, status: 1 });
 
 export default mongoose.model("WhatsAppSession", whatsAppSessionSchema);

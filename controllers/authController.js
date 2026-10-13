@@ -61,6 +61,12 @@ export const login = async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
+    if (user.status === "suspended") {
+      return res.status(403).json({
+        error: "Your account has been suspended by an administrator. Please contact support.",
+      });
+    }
+
     if (user.authProvider === "local" && user.firebaseUid) {
       const verification = await isFirebaseEmailPasswordVerified(
         email,
@@ -140,6 +146,11 @@ export const googleLogin = async (req, res) => {
         avatarUrl: picture,
       });
     } else {
+      if (user.status === "suspended") {
+        return res.status(403).json({
+          error: "Your account has been suspended by an administrator. Please contact support.",
+        });
+      }
       user.email = email;
       user.name = user.name || name;
       user.authProvider = "google";

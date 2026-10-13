@@ -48,15 +48,11 @@ async function callOpenRouter(message, summaryText, settings) {
 
 // Called for every incoming WhatsApp message on a session
 export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) {
-  if (senderJid && (senderJid.endsWith('@g.us') || senderJid.includes('@g.us'))) {
-    console.log(`[AI Agent] ${sessionId} — skipping group message from ${senderJid}`);
+  if (!text?.trim()) {
     return;
   }
 
-  if (!text?.trim()) {
-    console.log(`[AI Agent] ${sessionId} — skipping: empty text`);
-    return;
-  }
+  const isGroup = senderJid && (senderJid.endsWith('@g.us') || senderJid.includes('@g.us'));
 
   // Cooldown: skip if we replied to this jid within last 3 seconds (prevents double-fire)
   const cooldownKey = `${sessionId}:${senderJid}`;

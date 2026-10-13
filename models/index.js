@@ -12,4 +12,16 @@ export { default as SubscriptionSettings } from "./SubscriptionSettings.js";
 export { default as UserSubscription } from "./UserSubscription.js";
 export { default as WhatsAppAuthState } from "./WhatsAppAuthState.js";
 export { default as GroupBroadcast } from "./GroupBroadcast.js";
-
+export { default as WaChatNote } from "./WaChatNote.js";
+export { default as WaChatReminder } from "./WaChatReminder.js";
+export { default as WaStatus } from "./WaStatus.js";
+export { default as GroupMemberTask } from "./GroupMemberTask.js";
+export { default as ValidatorTask } from "./ValidatorTask.js";
+export { default as DripCampaign } from "./DripCampaign.js";
+export { default as DripRecipient } from "./DripRecipient.js";
+export { default as CrmContact } from "./CrmContact.js";
+export { default as WhatsAppGroup } from "./WhatsAppGroup.js";
+export { default as WaContact } from "./WaContact.js";
+export { default as WarmerTask } from "./WarmerTask.js";
+export { default as PaymentTransaction } from "./PaymentTransaction.js";
+export { default as OpenRouterSettings } from "./OpenRouterSettings.js";

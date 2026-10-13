@@ -1,8 +1,10 @@
 import express from "express";
+import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 import authMiddleware from "../middleware/auth.js";
 import User from "../models/User.js";
 import WhatsAppSession from "../models/WhatsAppSession.js";
+import WhatsAppAuthState from "../models/WhatsAppAuthState.js";
 import Message from "../models/Message.js";
 import Campaign from "../models/Campaign.js";
 import ApiKey from "../models/ApiKey.js";
@@ -14,6 +16,8 @@ import OpenRouterSettings from "../models/OpenRouterSettings.js";
 import MetaSystemSettings from "../meta/models/MetaSystemSettings.js";
 import GoogleOAuthSettings from "../models/GoogleOAuthSettings.js";
 import Flow from "../models/Flow.js";
+import WhatsAppService from "../services/WhatsAppService.js";
+import SubscriptionService from "../services/SubscriptionService.js";
 
 const router = express.Router();
 
@@ -313,7 +317,7 @@ router.get("/users", authMiddleware, async (req, res) => {
       msgCounts,
       subs,
     ] = await Promise.all([
-      User.countDocuments({ status: "active" }),
+      User.countDocuments({ status: { $ne: "suspended" } }),
       User.countDocuments({
         status: { $in: ["inactive", null, undefined] },
         $or: [{ status: "inactive" }, { status: { $exists: false } }],
@@ -410,7 +414,16 @@ router.post("/users", authMiddleware, async (req, res) => {
   try {
     if (!ensureAdmin(req, res)) return;
 
-    const { name, email, password, role = "user" } = req.body;
+    const {
+      name,
+      email,
+      password,
+      role = "user",
+      status = "active",
+      planId,
+      durationDays = 30,
+    } = req.body;
+
     if (!name || !email || !password) {
       return res.status(400).json({
         success: false,
@@ -435,7 +448,23 @@ router.post("/users", authMiddleware, async (req, res) => {
       email: email.toLowerCase().trim(),
       password,
       role,
+      status: status || "active",
     });
+
+    // If plan assigned directly from form, activate it
+    if (planId) {
+      try {
+        await SubscriptionService.assignPlanToUser(user._id, planId, {
+          durationDays: parseInt(durationDays) || 30,
+        });
+      } catch (subErr) {
+        console.warn("Could not assign initial plan in create user:", subErr.message);
+        await SubscriptionService.ensureUserSubscription(user);
+      }
+    } else {
+      await SubscriptionService.ensureUserSubscription(user);
+    }
+
     const { password: _, ...safe } = user.toObject();
     res.status(201).json({ success: true, data: safe });
   } catch (err) {
@@ -462,7 +491,64 @@ router.put("/users/:id", authMiddleware, async (req, res) => {
       .lean();
     if (!user)
       return res.status(404).json({ success: false, error: "User not found" });
+
+    // If activating user and also requested to activate subscription
+    if (req.body.activateSubscription && payload.status === "active") {
+      try {
+        await SubscriptionService.adjustUserSubscriptionDays(req.params.id, {
+          status: "active",
+          daysDelta: parseInt(req.body.durationDays) || 30,
+        });
+      } catch (subErr) {
+        console.warn("Could not activate subscription on user update:", subErr.message);
+      }
+    }
+
     res.json({ success: true, data: user });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// Quick 1-click status update (Active / Suspended)
+router.patch("/users/:id/status", authMiddleware, async (req, res) => {
+  try {
+    if (!ensureAdmin(req, res)) return;
+
+    const { status, activateSubscription, durationDays = 30 } = req.body;
+    if (!status || !["active", "suspended", "inactive"].includes(status)) {
+      return res.status(400).json({ success: false, error: "Invalid status value. Must be active, suspended, or inactive." });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true, runValidators: true }
+    )
+      .select("-password")
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({ success: false, error: "User not found" });
+    }
+
+    // If making active, also optionally activate user's subscription
+    if (status === "active" && activateSubscription) {
+      try {
+        await SubscriptionService.adjustUserSubscriptionDays(req.params.id, {
+          status: "active",
+          daysDelta: parseInt(durationDays) || 30,
+        });
+      } catch (subErr) {
+        console.warn("Could not activate subscription during quick activate:", subErr.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `User status updated to ${status} successfully`,
+      data: user,
+    });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
   }
@@ -529,6 +615,77 @@ router.get("/sessions", authMiddleware, async (req, res) => {
       },
     });
   } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Delete Single Session (Admin) ─────────────────────────────────────────────
+router.delete("/sessions/:id", authMiddleware, async (req, res) => {
+  try {
+    if (!ensureAdmin(req, res)) return;
+    const { id } = req.params;
+
+    const query = mongoose.isValidObjectId(id)
+      ? { $or: [{ _id: id }, { sessionId: id }] }
+      : { sessionId: id };
+
+    const session = await WhatsAppSession.findOne(query);
+
+    if (!session) {
+      return res.status(404).json({ success: false, error: "Session not found" });
+    }
+
+    await WhatsAppService.deleteSession(session.sessionId).catch((err) =>
+      console.error(`[Admin] Error deleting session ${session.sessionId}:`, err.message)
+    );
+
+    await WhatsAppSession.deleteOne({ _id: session._id }).catch(() => {});
+    await WhatsAppAuthState.deleteMany({ sessionId: session.sessionId }).catch(() => {});
+
+    res.json({ success: true, message: "Session deleted successfully" });
+  } catch (err) {
+    console.error("admin/sessions delete error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Bulk Delete Sessions (Admin) ──────────────────────────────────────────────
+router.post("/sessions/bulk-delete", authMiddleware, async (req, res) => {
+  try {
+    if (!ensureAdmin(req, res)) return;
+    const { ids } = req.body;
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, error: "ids array is required" });
+    }
+
+    const validObjectIds = ids.filter((id) => mongoose.isValidObjectId(id));
+    const sessions = await WhatsAppSession.find({
+      $or: [
+        { _id: { $in: validObjectIds } },
+        { sessionId: { $in: ids } },
+      ],
+    });
+
+    let deletedCount = 0;
+    for (const session of sessions) {
+      try {
+        await WhatsAppService.deleteSession(session.sessionId);
+        await WhatsAppSession.deleteOne({ _id: session._id });
+        await WhatsAppAuthState.deleteMany({ sessionId: session.sessionId }).catch(() => {});
+        deletedCount++;
+      } catch (err) {
+        console.error(`[Admin] Bulk delete error on ${session.sessionId}:`, err.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      deletedCount,
+      message: `Successfully deleted ${deletedCount} session(s)`,
+    });
+  } catch (err) {
+    console.error("admin/sessions bulk-delete error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });

@@ -128,6 +128,8 @@ export const duplicateList = async (req, res) => {
       numbers: [...original.numbers],
       tags: [...original.tags],
       color: original.color,
+      variables: original.variables || [],
+      contactData: original.contactData || [],
     });
     res.status(201).json({ list: formatList(copy) });
   } catch (err) {

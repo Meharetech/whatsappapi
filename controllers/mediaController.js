@@ -15,7 +15,7 @@ export const createCollection = async (req, res) => {
       userId,
       id: `col${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       name,
-      colorId: colorId || "blue",
+      colorId: colorId || "orange",
       media: [],
       subcollections: [],
     });

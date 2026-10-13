@@ -34,8 +34,7 @@ const collectionSchema = new mongoose.Schema(
     name: { type: String, required: true },
     colorId: {
       type: String,
-      enum: ["blue", "emerald", "violet", "amber", "rose", "cyan"],
-      default: "blue",
+      default: "orange",
     },
     created: { type: Date, default: Date.now },
     media: [mediaItemSchema],

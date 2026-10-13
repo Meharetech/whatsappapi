@@ -45,6 +45,40 @@ export const getAvailablePlans = async (req, res) => {
   }
 };
 
+// ── Public Plans Endpoint (No Auth Required for Landing Page) ───────────────
+export const getPublicPlans = async (req, res) => {
+  try {
+    const plans = await SubscriptionPlan.find({ isActive: true, isCustom: { $ne: true } })
+      .sort({ sortOrder: 1, priceMonthly: 1 })
+      .lean();
+
+    const formattedPlans = plans.map((p) => ({
+      _id: p._id,
+      id: p._id,
+      name: p.name,
+      slug: p.slug,
+      description: p.description || "",
+      currency: p.currency || "INR",
+      priceMonthly: p.priceMonthly || 0,
+      priceYearly: p.priceYearly || 0,
+      durationDays: p.durationDays || 30,
+      isDemo: !!p.isDemo,
+      sortOrder: p.sortOrder || 100,
+      limits: p.limits || {},
+      features: (p.features || []).filter((f) => f.enabled !== false),
+    }));
+
+    res.json({
+      success: true,
+      data: formattedPlans,
+      plans: formattedPlans,
+      count: formattedPlans.length,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+};
+
 export const switchMyPlan = async (req, res) => {
   try {
     const settings = await SubscriptionService.getSettings();
@@ -74,10 +108,21 @@ export const switchMyPlan = async (req, res) => {
       });
     }
 
-    // Block downgrade: paid active → free/demo
+    // Block switching to demo/free if trial is already used or expired
+    const isNewPlanDemoOrFree = plan.isDemo || ((plan.priceMonthly || 0) === 0 && (plan.priceYearly || 0) === 0);
     const currentSub = await SubscriptionService.getUserSubscription(
       req.user._id,
     );
+
+    if (isNewPlanDemoOrFree) {
+      if (currentSub?.trialUsed || currentSub?.status === "expired" || (currentSub?.expiresAt && new Date(currentSub.expiresAt) < new Date())) {
+        return res.status(400).json({
+          success: false,
+          error: "You have already used your free trial. Please upgrade to a paid plan to continue.",
+        });
+      }
+    }
+
     if (currentSub?.planId) {
       const cp = currentSub.planId;
       const currentPrice = (cp.priceMonthly || 0) + (cp.priceYearly || 0);
@@ -241,6 +286,18 @@ export const updateAdminSettings = async (req, res) => {
 
     const payload = { ...req.body } || {};
 
+    if (payload.defaultTrialDays !== undefined || payload.demoDurationDays !== undefined) {
+      const trialDays = Math.max(1, Number(payload.defaultTrialDays ?? payload.demoDurationDays) || 3);
+      payload.defaultTrialDays = trialDays;
+      payload.demoDurationDays = trialDays;
+
+      // Synchronize demo plans with new admin-specified trial duration
+      await SubscriptionPlan.updateMany({ isDemo: true }, { $set: { durationDays: trialDays } });
+      if (payload.demoPlanId) {
+        await SubscriptionPlan.findByIdAndUpdate(payload.demoPlanId, { $set: { durationDays: trialDays } });
+      }
+    }
+
     // Don't overwrite secret if the frontend sent back the masked placeholder
     if (
       payload.razorpayKeySecret &&
@@ -335,6 +392,39 @@ export const assignPlanToUser = async (req, res) => {
   }
 };
 
+export const adjustUserSubscription = async (req, res) => {
+  try {
+    if (!ensureAdmin(req, res)) return;
+
+    const { userId, daysDelta, customExpiresAt, planId, status, durationDays } = req.body;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "userId is required" });
+    }
+
+    const sub = await SubscriptionService.adjustUserSubscriptionDays(userId, {
+      daysDelta: daysDelta ?? durationDays,
+      customExpiresAt,
+      planId,
+      status,
+    });
+
+    res.json({
+      success: true,
+      message: "User subscription updated successfully",
+      data: {
+        subscription: {
+          status: sub.status,
+          startedAt: sub.startedAt,
+          expiresAt: sub.expiresAt,
+        },
+        plan: SubscriptionService.toClientPlan(sub.planId),
+      },
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+};
+
 export const getAdminUsersUsage = async (req, res) => {
   try {
     if (!ensureAdmin(req, res)) return;
@@ -379,6 +469,7 @@ export const getAdminUsersUsage = async (req, res) => {
 export default {
   getMySubscription,
   getAvailablePlans,
+  getPublicPlans,
   switchMyPlan,
   getAdminPlans,
   createAdminPlan,
@@ -387,5 +478,6 @@ export default {
   getAdminSettings,
   updateAdminSettings,
   assignPlanToUser,
+  adjustUserSubscription,
   getAdminUsersUsage,
 };

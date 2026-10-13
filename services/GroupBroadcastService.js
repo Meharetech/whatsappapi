@@ -58,29 +58,52 @@ export async function sendToGroups(
   minDelayMs = 3000,
   maxDelayMs = 8000,
   campaignId = null,
-  replyToLast = false
+  replyToLast = false,
+  targetGroups = []
 ) {
   console.log(`[GroupBroadcast] sendToGroups called for session: ${sessionId}, replyToLast: ${replyToLast}`);
 
   const sock = WhatsAppService.sockets.get(sessionId);
   if (!sock) throw new Error(`Session ${sessionId} is not connected or socket not found.`);
 
+  const targetGroupsMap = new Map();
+  if (Array.isArray(targetGroups)) {
+    targetGroups.forEach(tg => {
+      if (tg && tg.jid) targetGroupsMap.set(tg.jid, tg);
+    });
+  }
+
   const results = [];
   let sentCount = 0;
   let failedCount = 0;
+  let sentMembers = 0;
+  let failedMembers = 0;
 
   for (const jid of groupJids) {
     let groupName = "Unknown Group";
+    let memberCount = 0;
     
     try {
-      // Safely attempt to fetch the group name for reporting
+      // Safely attempt to fetch the group name and member count for reporting
       try {
         const metadata = await sock.groupMetadata(jid);
-        if (metadata && metadata.subject) {
-          groupName = metadata.subject;
+        if (metadata) {
+          if (metadata.subject) {
+            groupName = metadata.subject;
+          }
+          if (metadata.participants && Array.isArray(metadata.participants)) {
+            memberCount = metadata.participants.length;
+          }
         }
       } catch (metaErr) {
         console.warn(`[GroupBroadcast] Could not fetch metadata for ${jid}`);
+      }
+
+      // Fallback to targetGroups info if metadata failed or returned 0
+      if (targetGroupsMap.has(jid)) {
+        const tg = targetGroupsMap.get(jid);
+        if (!memberCount && tg.memberCount) memberCount = tg.memberCount;
+        if (groupName === "Unknown Group" && tg.groupName) groupName = tg.groupName;
       }
 
       // Determine if we should reply to the last message in this group JID
@@ -135,15 +158,24 @@ export async function sendToGroups(
         await sock.sendMessage(jid, { text: message }, { quoted: quotedMessage });
       }
 
-      results.push({ jid, groupName, status: "sent" });
+      results.push({ jid, groupName, memberCount, status: "sent" });
       sentCount++;
-      console.log(`[GroupBroadcast] ✅ Sent to ${jid}`);
+      sentMembers += memberCount;
+      console.log(`[GroupBroadcast] ✅ Sent to ${jid} (${memberCount} members)`);
     } catch (err) {
       const errorMsg = err?.message || String(err) || "Unknown error (e.g., bot not allowed to send in group)";
-      results.push({ jid, groupName, status: "failed", error: errorMsg });
+      if (targetGroupsMap.has(jid) && !memberCount) {
+        const tg = targetGroupsMap.get(jid);
+        if (tg.memberCount) memberCount = tg.memberCount;
+        if (groupName === "Unknown Group" && tg.groupName) groupName = tg.groupName;
+      }
+      results.push({ jid, groupName, memberCount, status: "failed", error: errorMsg });
       failedCount++;
+      failedMembers += memberCount;
       console.error(`[GroupBroadcast] ❌ Failed to send to ${jid}:`, errorMsg);
     }
+
+    const currentTotalMembers = results.reduce((sum, r) => sum + (r.memberCount || 0), 0);
 
     // Emit live real-time progress update over WebSockets!
     if (WhatsAppService.io && campaignId) {
@@ -153,7 +185,10 @@ export async function sendToGroups(
         stats: {
           total: groupJids.length,
           sent: sentCount,
-          failed: failedCount
+          failed: failedCount,
+          totalMembers: currentTotalMembers,
+          sentMembers,
+          failedMembers
         },
         results
       });
@@ -211,17 +246,24 @@ export async function startBroadcastCampaign(campaignId) {
         liveCampaign.minDelayMs || 3000,
         liveCampaign.maxDelayMs || 8000,
         campaignId,
-        liveCampaign.replyToLast || false
+        liveCampaign.replyToLast || false,
+        liveCampaign.targetGroups || []
       );
 
       const sentCount = results.filter(r => r.status === "sent").length;
       const failedCount = results.filter(r => r.status === "failed").length;
+      const sentMembers = results.filter(r => r.status === "sent").reduce((sum, r) => sum + (r.memberCount || 0), 0);
+      const failedMembers = results.filter(r => r.status === "failed").reduce((sum, r) => sum + (r.memberCount || 0), 0);
+      const totalMembers = results.reduce((sum, r) => sum + (r.memberCount || 0), 0) || liveCampaign.stats?.totalMembers || 0;
 
       liveCampaign.results = results;
       liveCampaign.stats = {
         total: liveCampaign.groupJids.length,
         sent: sentCount,
-        failed: failedCount
+        failed: failedCount,
+        totalMembers,
+        sentMembers,
+        failedMembers
       };
 
       if (liveCampaign.mode === "instant") {
@@ -256,10 +298,14 @@ export async function startBroadcastCampaign(campaignId) {
       if (liveCampaign) {
         liveCampaign.status = "failed";
         liveCampaign.results = [{ jid: "all", status: "failed", error: err.message }];
+        const totalMembers = liveCampaign.targetGroups?.reduce((s, g) => s + (g.memberCount || 0), 0) || liveCampaign.stats?.totalMembers || 0;
         liveCampaign.stats = {
           total: liveCampaign.groupJids.length,
           sent: 0,
-          failed: liveCampaign.groupJids.length
+          failed: liveCampaign.groupJids.length,
+          totalMembers,
+          sentMembers: 0,
+          failedMembers: totalMembers
         };
         await liveCampaign.save();
 

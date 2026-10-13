@@ -97,7 +97,13 @@ export const createCampaign = async (req, res) => {
     }
 
     // Verify session exists and belongs to user
-    const session = await WhatsAppSession.findOne({ _id: sessionId, userId });
+    const session = await WhatsAppSession.findOne({
+      userId,
+      $or: [
+        ...(mongoose.Types.ObjectId.isValid(sessionId) ? [{ _id: sessionId }] : []),
+        { sessionId: sessionId },
+      ],
+    });
     if (!session) {
       return res
         .status(404)
@@ -135,7 +141,7 @@ export const createCampaign = async (req, res) => {
       type,
       message,
       numberListId: new mongoose.Types.ObjectId(numberListId),
-      sessionId: new mongoose.Types.ObjectId(sessionId),
+      sessionId: session._id,
       mode: normalizedMode,
       startTime,
       scheduledFor:
@@ -159,8 +165,10 @@ export const createCampaign = async (req, res) => {
         const ids =
           Array.isArray(sessions) && sessions.length > 0
             ? sessions
-            : [sessionId];
-        return [...new Set(ids)].map((id) => new mongoose.Types.ObjectId(id));
+            : [session._id];
+        return [...new Set(ids)]
+          .map((id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : session._id))
+          .filter(Boolean);
       })(),
       multiSession: {
         enabled: !!(
@@ -565,23 +573,37 @@ export const getCampaignReport = async (req, res) => {
 
     // Calculate stats from messageLog for accuracy
     const messageLog = campaign.messageLog || [];
+    const sentOrDeliveredCount = messageLog.filter(
+      (m) => m.status === "sent" || m.status === "delivered",
+    ).length;
     const calculatedStats = {
       total: messageLog.length,
-      sent: messageLog.filter(
-        (m) => m.status === "sent" || m.status === "delivered",
-      ).length,
-      delivered: messageLog.filter((m) => m.status === "delivered").length,
+      sent: sentOrDeliveredCount,
+      delivered: sentOrDeliveredCount,
       failed: messageLog.filter((m) => m.status === "failed").length,
       pending: messageLog.filter((m) => m.status === "pending").length,
     };
 
     // Fallback to stored stats if messageLog calculation doesn't apply
-    const stats = calculatedStats.total > 0 ? calculatedStats : campaign.stats;
+    const storedStats = campaign.stats || {};
+    const effectiveDelivered = calculatedStats.total > 0
+      ? calculatedStats.delivered
+      : (storedStats.delivered || storedStats.sent || 0);
+    const effectiveTotal = calculatedStats.total > 0 ? calculatedStats.total : (storedStats.total || 0);
+
+    const stats = {
+      total: effectiveTotal,
+      sent: calculatedStats.total > 0 ? calculatedStats.sent : (storedStats.sent || 0),
+      delivered: effectiveDelivered,
+      failed: calculatedStats.total > 0 ? calculatedStats.failed : (storedStats.failed || 0),
+      pending: calculatedStats.total > 0 ? calculatedStats.pending : (storedStats.pending || 0),
+    };
 
     const deliveryRate =
-      stats.total > 0 ? ((stats.delivered / stats.total) * 100).toFixed(2) : 0;
+      stats.total > 0 ? ((stats.delivered / stats.total) * 100).toFixed(2) : "0.00";
+    const processed = stats.delivered + stats.failed;
     const successRate =
-      stats.sent > 0 ? ((stats.delivered / stats.sent) * 100).toFixed(2) : 0;
+      processed > 0 ? ((stats.delivered / processed) * 100).toFixed(2) : "0.00";
 
     // Get recent message logs (last 20)
     const recentLogs = messageLog.slice(-20).reverse();
@@ -708,12 +730,12 @@ async function sendCampaignMessages(campaign) {
 
     for (let i = 0; i < pendingMessages.length; i++) {
       const messageLog = pendingMessages[i];
-      let freshCampaign;
 
       try {
-        // Get fresh campaign data
-        freshCampaign = await Campaign.findById(campaign._id);
-        if (freshCampaign.status === "paused") {
+        // Check if campaign was paused without reading the entire document
+        const statusDoc = await Campaign.findById(campaign._id).select("status").lean();
+        if (!statusDoc || statusDoc.status === "paused") {
+          console.log(`[Campaign ${campaign._id}] Campaign paused or removed. Stopping send loop.`);
           break;
         }
 
@@ -831,25 +853,28 @@ async function sendCampaignMessages(campaign) {
           }
         }
 
-        const result = { status: "sent" };
-
         await SubscriptionService.consumeMessageQuota(
           campaign.userId,
           totalMessages,
         );
 
-        // Update message log to sent
-        const logEntry = freshCampaign.messageLog.find(
-          (l) => l.phoneNumber === messageLog.phoneNumber,
+        // Update message log to sent and update stats atomically
+        await Campaign.updateOne(
+          { _id: campaign._id, "messageLog.phoneNumber": messageLog.phoneNumber },
+          {
+            $set: {
+              "messageLog.$.status": "sent",
+              "messageLog.$.timestamp": new Date(),
+              "messageLog.$.sentBy": activeSession.id
+            },
+            $inc: {
+              "stats.sent": 1,
+              "stats.delivered": 1,
+              "stats.pending": -1
+            }
+          }
         );
-        if (logEntry) {
-          logEntry.status = "sent";
-          logEntry.timestamp = new Date();
-          logEntry.sentBy = activeSession.id;
-        }
 
-        freshCampaign.stats.sent += 1;
-        freshCampaign.stats.pending -= 1;
         successCount++;
         console.log(
           `✅ Message sent to +${messageLog.phoneNumber} via ${activeSession.phone}`,
@@ -859,66 +884,84 @@ async function sendCampaignMessages(campaign) {
           `❌ Failed to send to +${messageLog.phoneNumber}: ${error.message}`,
         );
 
-        if (freshCampaign) {
-          // Update message log to failed
-          const logEntry = freshCampaign.messageLog.find(
-            (l) => l.phoneNumber === messageLog.phoneNumber,
+        await Campaign.updateOne(
+          { _id: campaign._id, "messageLog.phoneNumber": messageLog.phoneNumber },
+          {
+            $set: {
+              "messageLog.$.status": "failed",
+              "messageLog.$.error": error.message
+            },
+            $inc: {
+              "stats.failed": 1,
+              "stats.pending": -1
+            }
+          }
+        );
+
+        failureCount++;
+
+        if (
+          error?.code === "LIMIT_EXCEEDED" ||
+          error?.name === "LimitError"
+        ) {
+          await Campaign.updateOne(
+            { _id: campaign._id },
+            { $set: { status: "failed", failedAt: new Date() } }
           );
-          if (logEntry) {
-            logEntry.status = "failed";
-            logEntry.error = error.message;
-          }
-
-          freshCampaign.stats.failed += 1;
-          freshCampaign.stats.pending -= 1;
-          failureCount++;
-
-          if (
-            error?.code === "LIMIT_EXCEEDED" ||
-            error?.name === "LimitError"
-          ) {
-            freshCampaign.status = "failed";
-            freshCampaign.failedAt = new Date();
-            await freshCampaign.save();
-            console.log(
-              "⛔ Campaign stopped due to subscription message limits",
-            );
-            break;
-          }
+          console.log(
+            "⛔ Campaign stopped due to subscription message limits",
+          );
+          break;
         }
       }
 
-      if (freshCampaign) {
-        // Update progress
-        const sent = freshCampaign.messageLog.filter(
-          (l) => l.status !== "pending",
-        ).length;
-        freshCampaign.progress = Math.round(
-          (sent / campaign.messageLog.length) * 100,
-        );
+      // Update overall progress percentage atomically
+      const currentProcessed = successCount + failureCount;
+      const progressPct = Math.min(100, Math.round((currentProcessed / pendingMessages.length) * 100));
 
-        await freshCampaign.save();
+      await Campaign.updateOne(
+        { _id: campaign._id },
+        {
+          $set: {
+            progress: progressPct,
+            currentIndex: i + 1,
+          },
+        },
+      );
 
-        // Calculate delay between messages
-        let delayMs = 0;
-        if (campaign.mode === "instant") {
-          // Safety random 5-10s delay even for instant mode to avoid spam detection
-          delayMs = (Math.floor(Math.random() * 6) + 5) * 1000;
-        } else if (campaign.randomizeDelay) {
-          const min = Math.max(campaign.minDelay || 10, 1);
-          const max = Math.max(campaign.maxDelay || 30, min);
-          const secs = Math.floor(Math.random() * (max - min + 1)) + min;
-          delayMs = secs * 1000;
-        } else {
-          delayMs = Math.max(campaign.delaySeconds || 10, 1) * 1000;
-        }
+      if (WhatsAppService.io && campaign.userId) {
+        WhatsAppService.io.to(`user:${campaign.userId}`).emit("campaign:update", {
+          campaignId: String(campaign._id),
+          progress: progressPct,
+          currentIndex: i + 1,
+          stats: {
+            sent: successCount,
+            failed: failureCount,
+            pending: Math.max(0, pendingMessages.length - currentProcessed),
+            total: pendingMessages.length,
+          },
+        });
+      }
 
-        // Apply delay only between messages (not after last one)
-        if (delayMs > 0 && i < pendingMessages.length - 1) {
-          const delaySec = (delayMs / 1000).toFixed(1);
-          console.log(`⏳ Waiting ${delaySec}s before next message...`);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-        }
+      // Calculate delay between messages
+      let delayMs = 0;
+      if (campaign.mode === "instant") {
+        // Safety random 5-10s delay even for instant mode to avoid spam detection
+        delayMs = (Math.floor(Math.random() * 6) + 5) * 1000;
+      } else if (campaign.randomizeDelay) {
+        const min = Math.max(campaign.minDelay || 10, 1);
+        const max = Math.max(campaign.maxDelay || 30, min);
+        const secs = Math.floor(Math.random() * (max - min + 1)) + min;
+        delayMs = secs * 1000;
+      } else {
+        delayMs = Math.max(campaign.delaySeconds || 10, 1) * 1000;
+      }
+
+      // Apply delay only between messages (not after last one)
+      if (delayMs > 0 && i < pendingMessages.length - 1) {
+        const delaySec = (delayMs / 1000).toFixed(1);
+        console.log(`⏳ Waiting ${delaySec}s before next message...`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
 
@@ -976,6 +1019,16 @@ async function sendCampaignMessages(campaign) {
       console.log(`\n✅ Campaign "${finalCampaign.name}" Completed!`);
       console.log(`   ✓ Sent: ${successCount}`);
       console.log(`   ✗ Failed: ${failureCount}\n`);
+
+      if (WhatsAppService.io && finalCampaign.userId) {
+        WhatsAppService.io.to(`user:${finalCampaign.userId}`).emit("campaign:completed", {
+          campaignId: String(finalCampaign._id),
+          status: "completed",
+          progress: 100,
+          completedAt: finalCampaign.completedAt,
+          stats: finalCampaign.stats,
+        });
+      }
 
       // Handle repeat scheduling: reset and re-queue for next run
       if (finalCampaign.repeat?.enabled) {

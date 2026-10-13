@@ -177,18 +177,30 @@ router.get("/agents/:id/replies", async (req, res) => {
   }
 });
 
-// ── Create / update agent (upsert by sessionId) ─────────────────────────────
+// ── Create / update agent (upsert by _id or sessionId) ─────────────────────────
 router.post("/agents", async (req, res) => {
   try {
-    const { sessionId, agentName, knowledgeSummaryId, config } = req.body;
-    if (!sessionId)
+    const { _id, sessionId, agentName, knowledgeSummaryId, config, autoReplyEnabled } = req.body;
+    if (!sessionId && !_id)
       return res
         .status(400)
-        .json({ success: false, error: "sessionId required" });
+        .json({ success: false, error: "sessionId or _id required" });
+
+    let existingAgent = null;
+    if (_id) {
+      existingAgent = await AiAgent.findOne({ _id, userId: req.user._id });
+    } else if (sessionId) {
+      existingAgent = await AiAgent.findOne({ sessionId, userId: req.user._id });
+    }
+
+    const effectiveSessionId = sessionId || existingAgent?.sessionId;
+    if (!effectiveSessionId) {
+      return res.status(400).json({ success: false, error: "sessionId required" });
+    }
 
     // Verify session belongs to user
     const session = await WhatsAppSession.findOne({
-      sessionId,
+      sessionId: effectiveSessionId,
       userId: req.user._id,
     });
     if (!session)
@@ -196,18 +208,29 @@ router.post("/agents", async (req, res) => {
         .status(404)
         .json({ success: false, error: "Session not found" });
 
-    const agent = await AiAgent.findOneAndUpdate(
-      { userId: req.user._id, sessionId },
-      {
-        $set: {
-          agentName: agentName || "AI Auto-Reply Agent",
-          isActive: true,
-          ...(knowledgeSummaryId ? { knowledgeSummaryId } : {}),
-          ...(config ? { config } : {}),
-        },
-      },
-      { upsert: true, new: true, runValidators: true },
-    );
+    const updateFields = {
+      agentName: agentName || "AI Auto-Reply Agent",
+      sessionId: effectiveSessionId,
+      isActive: true,
+      ...(autoReplyEnabled !== undefined ? { autoReplyEnabled } : {}),
+      ...(knowledgeSummaryId !== undefined ? { knowledgeSummaryId } : {}),
+      ...(config ? { config } : {}),
+    };
+
+    let agent;
+    if (existingAgent) {
+      agent = await AiAgent.findByIdAndUpdate(
+        existingAgent._id,
+        { $set: updateFields },
+        { new: true, runValidators: true }
+      );
+    } else {
+      agent = await AiAgent.create({
+        userId: req.user._id,
+        ...updateFields,
+        autoReplyEnabled: autoReplyEnabled !== undefined ? autoReplyEnabled : true,
+      });
+    }
 
     res.json({ success: true, data: agent });
   } catch (err) {
@@ -270,9 +293,18 @@ router.patch("/agents/:id/toggle", async (req, res) => {
     });
     if (!agent)
       return res.status(404).json({ success: false, error: "Agent not found" });
-    agent.isActive = !agent.isActive;
+    
+    const targetState = typeof req.body?.isActive === 'boolean' 
+      ? req.body.isActive 
+      : !agent.isActive;
+
+    agent.isActive = targetState;
+    agent.autoReplyEnabled = targetState;
+    if (targetState) agent.autoReplyStartedAt = new Date();
+    else agent.autoReplyStartedAt = null;
+
     await agent.save();
-    res.json({ success: true, data: { isActive: agent.isActive } });
+    res.json({ success: true, data: { isActive: agent.isActive, autoReplyEnabled: agent.autoReplyEnabled } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

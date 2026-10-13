@@ -114,9 +114,8 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const MONGODB_URI =
-  process.env.MONGODB_URI ||
-  "mongodb+srv://admin:admin@cmr0.3uulrrh.mongodb.net";
+const MONGODB_URI = process.env.MONGODB_URI;
+
 
 const start = async () => {
   try {

@@ -4,8 +4,17 @@ import { Server } from "socket.io";
 import mongoose from "mongoose";
 import cors from "cors";
 import dotenv from "dotenv";
+import { join, dirname } from "path";
+import { existsSync, mkdirSync } from "fs";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 dotenv.config();
+
+import { validateEnvironment } from "./config/validateEnv.js";
+const config = validateEnvironment();
 
 import authRoutes from "./routes/auth.js";
 import sessionRoutes from "./routes/sessions.js";
@@ -31,6 +40,11 @@ import googleReviewRoutes from "./google-review/routes/google-review.js";
 import pinterestRoutes from "./routes/pinterest.js";
 import reelRoutes from "./routes/reelCampaigns.js";
 import groupBroadcastRoutes from "./routes/groupBroadcast.js";
+import groupMemberTaskRoutes from "./routes/groupMemberTasks.js";
+import validatorRoutes from "./routes/validator.js";
+import dripRoutes from "./routes/dripCampaigns.js";
+import crmRoutes from "./routes/crm.js";
+import warmerRoutes from "./routes/warmer.js";
 import { setSocketIO as setReelSocketIO } from "./controllers/reelCampaignController.js";
 import { startUploadScheduler } from "./services/reels/uploadScheduler.js";
 import WhatsAppService from "./services/WhatsAppService.js";
@@ -38,7 +52,9 @@ import CampaignService from "./services/CampaignService.js";
 import SubscriptionService from "./services/SubscriptionService.js";
 import Campaign from "./models/Campaign.js";
 import OpenRouterSettings from "./models/OpenRouterSettings.js";
-import { startCampaignById } from "./controllers/campaignController.js";
+import reminderService from "./services/ReminderService.js";
+import dripService from "./services/DripService.js";
+import WarmerService from "./services/WarmerService.js";
 
 
 const app = express();
@@ -57,6 +73,8 @@ const io = new Server(httpServer, {
 WhatsAppService.setSocketIO(io);
 CampaignService.setSocketIO(io);
 setReelSocketIO(io);
+dripService.setSocketIO(io);
+WarmerService.setSocketIO(io);
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -83,14 +101,23 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 app.get("/", (req, res) => {
   res.send("WhatsApp API is running v2.0.1 by ME");
 });
 
 // Serve uploaded files
-app.use("/uploads", express.static("uploads"));
+const uploadsDir = existsSync(join(__dirname, "uploads"))
+  ? join(__dirname, "uploads")
+  : existsSync(join(process.cwd(), "uploads"))
+    ? join(process.cwd(), "uploads")
+    : join(__dirname, "uploads");
+if (!existsSync(uploadsDir)) {
+  mkdirSync(uploadsDir, { recursive: true });
+}
+app.use("/uploads", express.static(uploadsDir));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/sessions", sessionRoutes);
@@ -116,6 +143,11 @@ app.use("/api/google-review", googleReviewRoutes);
 app.use("/api/pinterest", pinterestRoutes);
 app.use("/api/reels", reelRoutes);
 app.use("/api/group-broadcast", groupBroadcastRoutes);
+app.use("/api/group-member-tasks", groupMemberTaskRoutes);
+app.use("/api/validator", validatorRoutes);
+app.use("/api/drip-campaigns", dripRoutes);
+app.use("/api/crm", crmRoutes);
+app.use("/api/warmer", warmerRoutes);
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
@@ -151,10 +183,8 @@ io.on("connection", (socket) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
-const MONGODB_URI =
-  process.env.MONGODB_URI ||
-  "mongodb+srv://admin:admin@cmr0.3uulrrh.mongodb.net";
+const PORT = config.port;
+const MONGODB_URI = config.mongoUri;
 
 const start = async () => {
   try {
@@ -163,41 +193,59 @@ const start = async () => {
       console.log(`🚀 Server running on port ${PORT}`);
     });
 
-    // ✅ 2. CONNECT MONGODB (NON-BLOCKING)
+    // ✅ 2. CONNECT MONGODB (ROBUST WITH AUTO-RETRY)
     console.log("Connecting to MongoDB...");
-    mongoose;
-    mongoose
-      .connect(MONGODB_URI)
-      .then(async () => {
-        console.log("✅ MongoDB connected");
+    mongoose.connection.on("connected", () => {
+      console.log("✅ MongoDB connected successfully");
+    });
+    mongoose.connection.on("error", (err) => {
+      console.error("❌ MongoDB connection error:", err.message);
+    });
+    mongoose.connection.on("disconnected", () => {
+      console.warn("⚠️ MongoDB disconnected. Mongoose will automatically attempt to reconnect.");
+    });
 
-        // Seed OpenRouter global settings from env key
-        if (process.env.OPENROUTER_API_KEY) {
-          await OpenRouterSettings.findOneAndUpdate(
-            { key: "global" },
-            {
-              $setOnInsert: { key: "global", provider: "openrouter", model: "openai/gpt-4o-mini" },
-              $set: { apiKey: process.env.OPENROUTER_API_KEY.trim() }
-            },
-            { upsert: true, new: true }
+    try {
+      await mongoose.connect(MONGODB_URI, {
+        serverSelectionTimeoutMS: 15000,
+        socketTimeoutMS: 45000,
+        maxPoolSize: 100,
+        minPoolSize: 10,
+        maxIdleTimeMS: 60000,
+      });
+
+      // ✅ 3. SEED & BOOTSTRAP (ONLY AFTER DB IS CONNECTED)
+      if (process.env.OPENROUTER_API_KEY) {
+        await OpenRouterSettings.findOneAndUpdate(
+          { key: "global" },
+          {
+            $setOnInsert: { key: "global", provider: "openrouter", model: "openai/gpt-4o-mini" },
+            $set: { apiKey: process.env.OPENROUTER_API_KEY.trim() },
+          },
+          { upsert: true, new: true }
+        )
+          .then((settings) =>
+            console.log(`[🔑 AI AGENT] Seeded OpenRouter API key successfully (model: ${settings.model})`)
           )
-          .then((settings) => console.log(`[🔑 AI AGENT] Seeded OpenRouter API key successfully (model: ${settings.model})`))
           .catch((e) => console.error("OpenRouter seed error:", e.message));
-        }
+      }
 
-        await WhatsAppService.restoreSessions().catch((err) =>
-          console.error("WA restore error:", err.message),
-        );
-      })
-      .catch((err) => console.error("❌ MongoDB error:", err.message));
+      await SubscriptionService.bootstrapDefaults().catch((err) =>
+        console.error("Bootstrap error:", err.message)
+      );
 
-    // ✅ 3. BOOTSTRAP (NON-BLOCKING)
-    SubscriptionService.bootstrapDefaults().catch((err) =>
-      console.error("Bootstrap error:", err.message),
-    );
+      await WhatsAppService.restoreSessions().catch((err) =>
+        console.error("WA restore error:", err.message)
+      );
+    } catch (err) {
+      console.error("❌ Initial MongoDB connection failed:", err.message);
+      console.log("Mongoose will retry connecting in the background.");
+    }
 
-    // ✅ 4. START REEL UPLOAD SCHEDULER
+    // ✅ 4. START REEL UPLOAD SCHEDULER & REMINDER SERVICE & DRIP SEQUENCES
     startUploadScheduler(io);
+    reminderService.start();
+    dripService.start();
 
     // ✅ 5. SCHEDULER (SAFE)
     // const runScheduler = async () => {

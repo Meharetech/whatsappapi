@@ -42,28 +42,73 @@ export const useMongoAuthState = async (sessionId) => {
       keys: {
         get: async (type, ids) => {
           const data = {};
-          await Promise.all(
-            ids.map(async (id) => {
-              let value = await readData(type, id);
-              if (type === "app-state-sync-key" && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+          if (!ids || ids.length === 0) return data;
+
+          try {
+            const docs = await WhatsAppAuthState.find({
+              sessionId,
+              dataType: type,
+              dataId: { $in: ids }
+            }).lean();
+
+            const docMap = new Map();
+            for (const doc of docs) {
+              if (doc && doc.dataJson) {
+                try {
+                  let value = JSON.parse(doc.dataJson, BufferJSON.reviver);
+                  if (type === "app-state-sync-key" && value) {
+                    value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                  }
+                  docMap.set(doc.dataId, value);
+                } catch (parseErr) {}
               }
-              data[id] = value;
-            })
-          );
+            }
+
+            for (const id of ids) {
+              data[id] = docMap.has(id) ? docMap.get(id) : null;
+            }
+          } catch (err) {
+            console.error("[useMongoAuthState] keys.get error:", { sessionId, type, error: err.message });
+            for (const id of ids) {
+              data[id] = null;
+            }
+          }
+
           return data;
         },
         set: async (data) => {
-          const tasks = [];
+          const bulkOps = [];
           for (const category in data) {
             for (const id in data[category]) {
               const value = data[category][id];
-              tasks.push(
-                value ? writeData(value, category, id) : removeData(category, id)
-              );
+              if (value) {
+                try {
+                  const dataJson = JSON.stringify(value, BufferJSON.replacer);
+                  bulkOps.push({
+                    updateOne: {
+                      filter: { sessionId, dataType: category, dataId: id },
+                      update: { $set: { dataJson } },
+                      upsert: true,
+                    },
+                  });
+                } catch (e) {}
+              } else {
+                bulkOps.push({
+                  deleteOne: {
+                    filter: { sessionId, dataType: category, dataId: id },
+                  },
+                });
+              }
             }
           }
-          await Promise.all(tasks);
+
+          if (bulkOps.length > 0) {
+            try {
+              await WhatsAppAuthState.bulkWrite(bulkOps, { ordered: false });
+            } catch (err) {
+              console.error("[useMongoAuthState] keys.set bulkWrite error:", { sessionId, error: err.message });
+            }
+          }
         },
       },
     },

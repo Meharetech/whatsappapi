@@ -6,9 +6,7 @@ const PINTEREST_HOST =
 const PINTEREST_DOWNLOAD_HOST =
   process.env.PINTEREST_RAPIDAPI_DOWNLOAD_HOST ||
   "pinterest-video-and-image-downloader.p.rapidapi.com";
-const PINTEREST_KEY =
-  process.env.PINTEREST_RAPIDAPI_KEY ||
-  "6a973fc0acmsh7664582b4d7010ep1aaeb2jsn5016b6a1802b";
+const PINTEREST_KEY = process.env.PINTEREST_RAPIDAPI_KEY || "";
 
 function normalizePinterestVideoUrl(url) {
   try {

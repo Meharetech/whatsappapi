@@ -81,7 +81,13 @@ export async function uploadReel({
     if (filePath && /^https?:\/\//i.test(filePath)) {
       publicUrl = filePath;
     } else {
-      publicUrl = `${process.env.PUBLIC_BASE_URL || "http://localhost:3000"}/uploads/${path
+      const publicBase = (
+        process.env.PUBLIC_BASE_URL ||
+        process.env.BASE_URL ||
+        process.env.BACKEND_URL ||
+        "http://localhost:3000"
+      ).replace(/\/+$/, "");
+      publicUrl = `${publicBase}/uploads/${path
         .relative(process.cwd() + "/uploads", filePath)
         .replace(/\\/g, "/")}`;
     }
