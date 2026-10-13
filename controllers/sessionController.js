@@ -112,6 +112,34 @@ export const deleteSession = async (req, res) => {
   }
 };
 
+export const bulkDeleteSessions = async (req, res) => {
+  try {
+    const { sessionIds } = req.body;
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return res.status(400).json({ success: false, error: "No sessionIds provided" });
+    }
+
+    const sessions = await WhatsAppSession.find({
+      sessionId: { $in: sessionIds },
+      userId: req.user._id,
+    });
+
+    const deletedIds = [];
+    for (const session of sessions) {
+      try {
+        await WhatsAppService.deleteSession(session.sessionId);
+        deletedIds.push(session.sessionId);
+      } catch (err) {
+        console.error(`Failed to delete session ${session.sessionId}:`, err);
+      }
+    }
+
+    res.json({ success: true, count: deletedIds.length, deletedIds });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+};
+
 export const getSessionQR = async (req, res) => {
   try {
     const { id } = req.params;
@@ -562,6 +590,7 @@ export default {
   getSession,
   getSessionQR,
   deleteSession,
+  bulkDeleteSessions,
   logoutSession,
   reconnectSession,
   reconnectAllSessions,

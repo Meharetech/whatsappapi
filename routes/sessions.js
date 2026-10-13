@@ -10,6 +10,7 @@ router.post("/reconnect-all", authMiddleware, sessionController.reconnectAllSess
 router.get("/", authMiddleware, sessionController.listSessions);
 router.get("/:id", authMiddleware, sessionController.getSession);
 router.get("/:id/qr", authMiddleware, sessionController.getSessionQR);
+router.post("/bulk-delete", authMiddleware, sessionController.bulkDeleteSessions);
 router.delete("/:id", authMiddleware, sessionController.deleteSession);
 router.post("/:id/logout", authMiddleware, sessionController.logoutSession);
 router.post("/:id/pairing-code", authMiddleware, sessionController.getPairingCode);

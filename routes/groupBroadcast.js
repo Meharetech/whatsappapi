@@ -144,7 +144,6 @@ router.post("/:id/pause", authMiddleware, async (req, res) => {
   try {
     const campaign = await GroupBroadcast.findOne({ _id: req.params.id, userId: req.user._id });
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
-    if (campaign.mode !== "repeat") return res.status(400).json({ error: "Only repeating campaigns can be paused" });
 
     const updated = await pauseBroadcastCampaign(campaign._id.toString());
     res.json({ success: true, campaign: updated });

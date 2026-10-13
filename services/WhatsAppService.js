@@ -428,11 +428,15 @@ class WhatsAppService {
     }
 
     if (this.io) {
-      this.io.to(sessionId).emit("status", {
+      const statusPayload = {
         sessionId,
         status,
         ...patch,
-      });
+      };
+      this.io.to(sessionId).emit("status", statusPayload);
+      if (session.userId) {
+        this.io.to(`user:${session.userId.toString()}`).emit("status", statusPayload);
+      }
     }
 
     return updateData;
@@ -850,6 +854,15 @@ class WhatsAppService {
           return;
         }
 
+        const currentAttempts = this.reconnectAttempts.get(sessionId) || 0;
+        if (currentAttempts >= 2) {
+          console.log("[WA HEARTBEAT] Max 2 reconnect attempts reached, marking disconnected", { sessionId });
+          this.clearHeartbeat(sessionId);
+          this.removeSocket(sessionId);
+          await this.handleSessionStateChange(sessionId, "disconnected");
+          return;
+        }
+
         console.log("[WA HEARTBEAT] connection or auth lost, reconnecting", { sessionId, isAuthenticated, isOpen });
 
         this.clearHeartbeat(sessionId);
@@ -1211,9 +1224,9 @@ class WhatsAppService {
           const nextAttempts = (this.reconnectAttempts.get(sessionId) || 0) + 1;
           this.reconnectAttempts.set(sessionId, nextAttempts);
 
-          if (nextAttempts > 4) {
+          if (nextAttempts > 2) {
             console.warn(
-              `[WA CONFLICT] Session ${sessionId} repeatedly conflicted (replaced by another connection). Pausing auto-reconnect without deleting creds.`,
+              `[WA CONFLICT] Session ${sessionId} repeatedly conflicted (2 attempts reached). Pausing auto-reconnect without deleting creds.`,
             );
             this.removeSocket(sessionId);
             await this.handleSessionStateChange(sessionId, "disconnected", {
@@ -1225,7 +1238,7 @@ class WhatsAppService {
           // Backoff with minimum 8s to 25s so previous ghost socket closes cleanly on WhatsApp server
           const conflictDelay = Math.min(25000, 8000 * Math.pow(1.5, nextAttempts - 1));
           console.log(
-            `[WA CONFLICT] Session ${sessionId} stream conflict detected. Backing off for ${conflictDelay}ms (attempt ${nextAttempts}/4)...`,
+            `[WA CONFLICT] Session ${sessionId} stream conflict detected. Backing off for ${conflictDelay}ms (attempt ${nextAttempts}/2)...`,
           );
           this.removeSocket(sessionId);
           await this.handleSessionStateChange(sessionId, "connecting");
@@ -1296,11 +1309,23 @@ class WhatsAppService {
           return;
         }
 
-        // Temporary disconnects with valid auth: mark connecting and attempt reconnect
+        // Temporary disconnects with valid auth: mark connecting and attempt reconnect (max 2 attempts)
         if (isValidCreds) {
+          const currentAttempts = this.reconnectAttempts.get(sessionId) || 0;
+          if (currentAttempts >= 2) {
+            console.warn(
+              `[WA RECONNECT] Session ${sessionId} reached max 2 reconnect attempts, marking disconnected`,
+              { sessionId, attempts: currentAttempts },
+            );
+            this.removeSocket(sessionId);
+            await this.handleSessionStateChange(sessionId, "disconnected", {
+              error: "Session disconnected. Reconnection attempt limit (2) reached.",
+            });
+            return;
+          }
           const delay = this.getReconnectDelay(sessionId, 3000, 30000);
           console.log(
-            `[WA RECONNECT] soft disconnect with valid auth, reconnecting in ${delay}ms`,
+            `[WA RECONNECT] soft disconnect with valid auth, reconnecting in ${delay}ms (attempt ${currentAttempts + 1}/2)`,
             { sessionId, isValidCreds, delay },
           );
           this.removeSocket(sessionId);
@@ -1334,12 +1359,21 @@ class WhatsAppService {
           return;
         }
 
-        // If creds exist, schedule a recovery reconnect; otherwise mark disconnected
+        // If creds exist, schedule a recovery reconnect; otherwise mark disconnected (max 2 attempts)
         const hasCreds = await this.validateSessionCredentials(sessionId);
         if (hasCreds) {
+          const currentAttempts = this.reconnectAttempts.get(sessionId) || 0;
+          if (currentAttempts >= 2) {
+            console.warn(`[WA RECONNECT] Max 2 recovery attempts reached for ${sessionId}, marking disconnected`);
+            this.removeSocket(sessionId);
+            await this.handleSessionStateChange(sessionId, "disconnected", {
+              error: "Session disconnected. Reconnection attempt limit (2) reached.",
+            });
+            return;
+          }
           const delay = this.getReconnectDelay(sessionId, 15000, 60000); // Base 15s, max 60s for recovery
           console.log(
-            `[WA RECONNECT] recovery reconnect scheduled in ${delay}ms`,
+            `[WA RECONNECT] recovery reconnect scheduled in ${delay}ms (attempt ${currentAttempts + 1}/2)`,
             { sessionId, delay },
           );
           await this.handleSessionStateChange(sessionId, "connecting");
@@ -2036,14 +2070,17 @@ class WhatsAppService {
       return { sessionId, status: "connecting" };
     }
 
-    // Check retry limit - max 5 attempts (don't limit restarts or force)
+    // Check retry limit - max 2 attempts (don't limit restarts or force)
     const attempts = this.reconnectAttempts.get(sessionId) || 0;
-    if (attempts > 5 && !isRestart && !force) {
+    if (attempts >= 2 && !isRestart && !force) {
       console.log(
-        `[WA RECONNECT] too many retries (${attempts}) → pausing session ${sessionId}`,
+        `[WA RECONNECT] retry limit reached (${attempts}) → marking disconnected for session ${sessionId}`,
       );
-      await this.handleSessionStateChange(sessionId, "disconnected");
-      return;
+      this.removeSocket(sessionId);
+      await this.handleSessionStateChange(sessionId, "disconnected", {
+        error: "Session disconnected. Reconnection attempt limit (2) reached.",
+      });
+      return { sessionId, status: "disconnected" };
     }
 
     // Prevent duplicate reconnects
@@ -2216,7 +2253,12 @@ class WhatsAppService {
           const hasCreds = await this.validateSessionCredentials(s.sessionId);
           if (hasCreds) {
             const attempts = this.reconnectAttempts.get(s.sessionId) || 0;
-            if (attempts > 3) continue; // Skip sessions that have repeatedly failed
+            if (attempts >= 2) {
+              if (s.status === "connecting") {
+                await this.handleSessionStateChange(s.sessionId, "disconnected");
+              }
+              continue; // Skip sessions that reached 2 retry attempts
+            }
             const lastAttempt = this.reconnectCooldown.get(s.sessionId) || 0;
             if (Date.now() - lastAttempt > 45000) {
               console.log(`[WA WATCHDOG] Auto-reconnecting inactive session ${s.sessionId}...`);

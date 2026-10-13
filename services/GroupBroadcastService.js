@@ -59,12 +59,13 @@ export async function sendToGroups(
   maxDelayMs = 8000,
   campaignId = null,
   replyToLast = false,
-  targetGroups = []
+  targetGroups = [],
+  existingResults = []
 ) {
-  console.log(`[GroupBroadcast] sendToGroups called for session: ${sessionId}, replyToLast: ${replyToLast}`);
+  console.log(`[GroupBroadcast] sendToGroups called for session: ${sessionId}, campaign: ${campaignId}, replyToLast: ${replyToLast}`);
 
   const sock = WhatsAppService.sockets.get(sessionId);
-  if (!sock) throw new Error(`Session ${sessionId} is not connected or socket not found.`);
+  if (!sock) throw new Error(`WhatsApp session "${sessionId}" is not active or connected.`);
 
   const targetGroupsMap = new Map();
   if (Array.isArray(targetGroups)) {
@@ -73,40 +74,82 @@ export async function sendToGroups(
     });
   }
 
-  const results = [];
-  let sentCount = 0;
-  let failedCount = 0;
-  let sentMembers = 0;
-  let failedMembers = 0;
+  // Preserve any previously sent groups when resuming
+  const results = Array.isArray(existingResults) ? [...existingResults] : [];
 
-  for (const jid of groupJids) {
+  for (let idx = 0; idx < groupJids.length; idx++) {
+    const jid = groupJids[idx];
+
+    // Check if campaign was paused mid-execution
+    if (campaignId) {
+      const liveCheck = await GroupBroadcast.findById(campaignId).select("status");
+      if (liveCheck && liveCheck.status === "paused") {
+        console.log(`[GroupBroadcast] Campaign ${campaignId} paused by user. Halting group send loop.`);
+        break;
+      }
+    }
+
     let groupName = "Unknown Group";
     let memberCount = 0;
-    
+
+    // Fallback to targetGroups mapping if available
+    if (targetGroupsMap.has(jid)) {
+      const tg = targetGroupsMap.get(jid);
+      if (tg.groupName) groupName = tg.groupName;
+      if (tg.memberCount) memberCount = tg.memberCount;
+    }
+
+    // Attempt to fetch fresh metadata from Baileys socket
     try {
-      // Safely attempt to fetch the group name and member count for reporting
-      try {
-        const metadata = await sock.groupMetadata(jid);
-        if (metadata) {
-          if (metadata.subject) {
-            groupName = metadata.subject;
-          }
-          if (metadata.participants && Array.isArray(metadata.participants)) {
-            memberCount = metadata.participants.length;
-          }
+      const metadata = await sock.groupMetadata(jid);
+      if (metadata) {
+        if (metadata.subject) groupName = metadata.subject;
+        if (metadata.participants && Array.isArray(metadata.participants)) {
+          memberCount = metadata.participants.length;
         }
-      } catch (metaErr) {
-        console.warn(`[GroupBroadcast] Could not fetch metadata for ${jid}`);
       }
+    } catch (metaErr) {
+      console.warn(`[GroupBroadcast] Could not fetch live metadata for ${jid}: ${metaErr.message}`);
+    }
 
-      // Fallback to targetGroups info if metadata failed or returned 0
-      if (targetGroupsMap.has(jid)) {
-        const tg = targetGroupsMap.get(jid);
-        if (!memberCount && tg.memberCount) memberCount = tg.memberCount;
-        if (groupName === "Unknown Group" && tg.groupName) groupName = tg.groupName;
-      }
+    // Broadcast LIVE "SENDING" status BEFORE socket transmission
+    if (WhatsAppService.io && campaignId) {
+      const preSentCount = results.filter(r => r.status === "sent").length;
+      const preFailedCount = results.filter(r => r.status === "failed").length;
+      const preSentMembers = results.filter(r => r.status === "sent").reduce((s, r) => s + (r.memberCount || 0), 0);
+      const preFailedMembers = results.filter(r => r.status === "failed").reduce((s, r) => s + (r.memberCount || 0), 0);
+      const preTotalMembers = targetGroups.reduce((s, g) => s + (g.memberCount || 0), 0) || memberCount;
 
-      // Determine if we should reply to the last message in this group JID
+      const progressEvent = {
+        campaignId,
+        status: "running",
+        currentSending: {
+          jid,
+          groupName,
+          memberCount,
+          index: idx + 1,
+          total: groupJids.length,
+          status: "sending"
+        },
+        stats: {
+          total: groupJids.length,
+          sent: preSentCount,
+          failed: preFailedCount,
+          totalMembers: preTotalMembers,
+          sentMembers: preSentMembers,
+          failedMembers: preFailedMembers
+        },
+        results
+      };
+
+      WhatsAppService.io.to(`user:${userId}`).emit("campaign:progress", progressEvent);
+      WhatsAppService.io.emit("campaign:progress", progressEvent);
+      WhatsAppService.io.emit("group-broadcast:progress", progressEvent);
+    }
+
+    // Transmit to the WhatsApp group
+    try {
+      // Determine if quoting the last message
       let quotedMessage = undefined;
       if (replyToLast) {
         try {
@@ -128,12 +171,9 @@ export async function sendToGroups(
             if (lastMsg.participantJid && lastMsg.direction !== "out") {
               quotedMessage.key.participant = lastMsg.participantJid;
             }
-            console.log(`[GroupBroadcast] Quoting last message for group ${jid} (ID: ${lastMsg.messageId})`);
-          } else {
-            console.log(`[GroupBroadcast] No previous message found in DB for group ${jid} to reply to.`);
           }
         } catch (dbErr) {
-          console.error(`[GroupBroadcast] Failed to retrieve last message for JID ${jid}:`, dbErr.message);
+          console.error(`[GroupBroadcast] Failed to retrieve last message for ${jid}:`, dbErr.message);
         }
       }
 
@@ -158,48 +198,87 @@ export async function sendToGroups(
         await sock.sendMessage(jid, { text: message }, { quoted: quotedMessage });
       }
 
-      results.push({ jid, groupName, memberCount, status: "sent" });
-      sentCount++;
-      sentMembers += memberCount;
-      console.log(`[GroupBroadcast] ✅ Sent to ${jid} (${memberCount} members)`);
+      const existingIdx = results.findIndex(r => r.jid === jid);
+      const resItem = { jid, groupName, memberCount, status: "sent" };
+      if (existingIdx >= 0) results[existingIdx] = resItem;
+      else results.push(resItem);
+
+      console.log(`[GroupBroadcast] ✅ Sent to group ${groupName} (${jid})`);
     } catch (err) {
-      const errorMsg = err?.message || String(err) || "Unknown error (e.g., bot not allowed to send in group)";
-      if (targetGroupsMap.has(jid) && !memberCount) {
-        const tg = targetGroupsMap.get(jid);
-        if (tg.memberCount) memberCount = tg.memberCount;
-        if (groupName === "Unknown Group" && tg.groupName) groupName = tg.groupName;
-      }
-      results.push({ jid, groupName, memberCount, status: "failed", error: errorMsg });
-      failedCount++;
-      failedMembers += memberCount;
+      const errorMsg = err?.message || String(err) || "Unknown error";
+      const existingIdx = results.findIndex(r => r.jid === jid);
+      const resItem = { jid, groupName, memberCount, status: "failed", error: errorMsg };
+      if (existingIdx >= 0) results[existingIdx] = resItem;
+      else results.push(resItem);
+
       console.error(`[GroupBroadcast] ❌ Failed to send to ${jid}:`, errorMsg);
     }
 
-    const currentTotalMembers = results.reduce((sum, r) => sum + (r.memberCount || 0), 0);
+    // Compute live cumulative stats
+    const sentCount = results.filter(r => r.status === "sent").length;
+    const failedCount = results.filter(r => r.status === "failed").length;
+    const sentMembers = results.filter(r => r.status === "sent").reduce((s, r) => s + (r.memberCount || 0), 0);
+    const failedMembers = results.filter(r => r.status === "failed").reduce((s, r) => s + (r.memberCount || 0), 0);
+    const totalMembers = targetGroups.reduce((s, g) => s + (g.memberCount || 0), 0) || results.reduce((s, r) => s + (r.memberCount || 0), 0);
 
-    // Emit live real-time progress update over WebSockets!
+    const statsObj = {
+      total: groupJids.length,
+      sent: sentCount,
+      failed: failedCount,
+      totalMembers,
+      sentMembers,
+      failedMembers
+    };
+
+    // Immediately persist live progress to database
+    if (campaignId) {
+      try {
+        await GroupBroadcast.findByIdAndUpdate(campaignId, {
+          stats: statsObj,
+          results
+        });
+      } catch (saveErr) {
+        console.error(`[GroupBroadcast] Failed to update intermediate progress in DB:`, saveErr.message);
+      }
+    }
+
+    // Emit live WebSocket update after sending this group
     if (WhatsAppService.io && campaignId) {
-      console.log(`[GroupBroadcast] Emitting live campaign progress update to user room user:${userId}`);
-      WhatsAppService.io.to(`user:${userId}`).emit("campaign:progress", {
+      const lastRes = results.find(r => r.jid === jid);
+      const progressEvent = {
         campaignId,
-        stats: {
+        status: "running",
+        currentSending: {
+          jid,
+          groupName,
+          memberCount,
+          index: idx + 1,
           total: groupJids.length,
-          sent: sentCount,
-          failed: failedCount,
-          totalMembers: currentTotalMembers,
-          sentMembers,
-          failedMembers
+          status: lastRes?.status || "sent",
+          error: lastRes?.error
         },
+        stats: statsObj,
         results
-      });
+      };
+
+      WhatsAppService.io.to(`user:${userId}`).emit("campaign:progress", progressEvent);
+      WhatsAppService.io.emit("campaign:progress", progressEvent);
+      WhatsAppService.io.emit("group-broadcast:progress", progressEvent);
+    }
+
+    // Check again before sleeping if paused
+    if (campaignId) {
+      const pausedCheck = await GroupBroadcast.findById(campaignId).select("status");
+      if (pausedCheck && pausedCheck.status === "paused") {
+        break;
+      }
     }
 
     // Calculate randomized anti-ban delay for this iteration
     const currentDelay = Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1) + minDelayMs);
 
-    // Delay between groups to reduce ban risk (skip on the last group)
-    if (currentDelay > 0 && groupJids.indexOf(jid) < groupJids.length - 1) {
-      console.log(`[GroupBroadcast] Sleeping for ${currentDelay}ms before next group...`);
+    if (currentDelay > 0 && idx < groupJids.length - 1) {
+      console.log(`[GroupBroadcast] Anti-ban delay: sleeping ${currentDelay}ms before next group...`);
       await new Promise((r) => setTimeout(r, currentDelay));
     }
   }
@@ -216,39 +295,91 @@ export async function startBroadcastCampaign(campaignId) {
   if (!campaign) throw new Error("Campaign not found");
 
   // If already running, do nothing
-  if (activeJobs.has(campaignId)) return campaign;
+  if (activeJobs.has(campaignId) && campaign.status === "running") {
+    return campaign;
+  }
+
+  // If restarting a completed or failed campaign, reset stats and results
+  if (campaign.status === "completed" || campaign.status === "failed") {
+    campaign.stats = {
+      total: campaign.groupJids.length,
+      sent: 0,
+      failed: 0,
+      totalMembers: campaign.stats?.totalMembers || 0,
+      sentMembers: 0,
+      failedMembers: 0
+    };
+    campaign.results = [];
+  }
 
   campaign.status = "running";
   await campaign.save();
+
+  // Emit immediate WebSocket update so frontend UI transitions to RUNNING immediately
+  if (WhatsAppService.io) {
+    const startPayload = {
+      campaignId,
+      status: "running",
+      stats: campaign.stats,
+      results: campaign.results || [],
+      currentSending: null
+    };
+    WhatsAppService.io.to(`user:${campaign.userId.toString()}`).emit("campaign:update", startPayload);
+    WhatsAppService.io.emit("campaign:update", startPayload);
+    WhatsAppService.io.emit("group-broadcast:update", startPayload);
+  }
 
   const fireCycle = async () => {
     try {
       const liveCampaign = await GroupBroadcast.findById(campaignId);
       if (!liveCampaign || liveCampaign.status !== "running") {
-        // Stop repeat if deleted or paused
         clearInterval(activeJobs.get(campaignId));
+        clearTimeout(activeJobs.get(campaignId));
         activeJobs.delete(campaignId);
         return;
       }
 
-      // Re-fetch media path if exists (using absolute resolved folder path)
+      // Re-fetch media path if exists
       let mediaPath = null;
       if (liveCampaign.mediaName) {
         mediaPath = join(uploadsDir, liveCampaign.mediaName);
       }
 
+      // For instant mode resuming a paused campaign, send to remaining unsent groups
+      let targetJids = liveCampaign.groupJids;
+      let initialResults = liveCampaign.results ? [...liveCampaign.results] : [];
+
+      if (liveCampaign.mode === "instant" && initialResults.length > 0) {
+        const sentJids = new Set(initialResults.filter(r => r.status === "sent").map(r => r.jid));
+        const remaining = liveCampaign.groupJids.filter(jid => !sentJids.has(jid));
+        if (remaining.length > 0 && remaining.length < liveCampaign.groupJids.length) {
+          targetJids = remaining;
+        } else if (remaining.length === 0) {
+          initialResults = [];
+        }
+      }
+
       const results = await sendToGroups(
         liveCampaign.userId.toString(),
         liveCampaign.sessionId,
-        liveCampaign.groupJids,
+        targetJids,
         liveCampaign.message,
         mediaPath,
         liveCampaign.minDelayMs || 3000,
         liveCampaign.maxDelayMs || 8000,
         campaignId,
         liveCampaign.replyToLast || false,
-        liveCampaign.targetGroups || []
+        liveCampaign.targetGroups || [],
+        initialResults
       );
+
+      // Check if paused during sending
+      const postCheck = await GroupBroadcast.findById(campaignId);
+      if (postCheck && postCheck.status === "paused") {
+        console.log(`[GroupBroadcast] Campaign ${campaignId} paused by user. Keeping status as paused.`);
+        activeJobs.delete(campaignId);
+        return;
+      }
 
       const sentCount = results.filter(r => r.status === "sent").length;
       const failedCount = results.filter(r => r.status === "failed").length;
@@ -272,18 +403,22 @@ export async function startBroadcastCampaign(campaignId) {
 
       await liveCampaign.save();
 
-      // Emit live WebSocket update indicating completion/failure
+      // Emit live WebSocket update indicating completion/cycle end
       if (WhatsAppService.io) {
-        console.log(`[GroupBroadcast] Emitting live campaign update (completed) to room user:${liveCampaign.userId.toString()}`);
-        WhatsAppService.io.to(`user:${liveCampaign.userId.toString()}`).emit("campaign:update", {
+        console.log(`[GroupBroadcast] Emitting live campaign update (${liveCampaign.status})`);
+        const updatePayload = {
           campaignId,
           status: liveCampaign.status,
           stats: liveCampaign.stats,
-          results: liveCampaign.results
-        });
+          results: liveCampaign.results,
+          currentSending: null
+        };
+        WhatsAppService.io.to(`user:${liveCampaign.userId.toString()}`).emit("campaign:update", updatePayload);
+        WhatsAppService.io.emit("campaign:update", updatePayload);
+        WhatsAppService.io.emit("group-broadcast:update", updatePayload);
       }
 
-      // If repeat mode, schedule the next cycle AFTER this one finishes
+      // If repeat mode and still running, schedule next cycle
       if (liveCampaign.mode === "repeat" && liveCampaign.status === "running") {
         const timeoutId = setTimeout(fireCycle, liveCampaign.intervalMs);
         activeJobs.set(campaignId, timeoutId);
@@ -309,14 +444,17 @@ export async function startBroadcastCampaign(campaignId) {
         };
         await liveCampaign.save();
 
-        // Emit failure live update
         if (WhatsAppService.io) {
-          WhatsAppService.io.to(`user:${liveCampaign.userId.toString()}`).emit("campaign:update", {
+          const failPayload = {
             campaignId,
             status: "failed",
             stats: liveCampaign.stats,
-            results: liveCampaign.results
-          });
+            results: liveCampaign.results,
+            currentSending: null
+          };
+          WhatsAppService.io.to(`user:${liveCampaign.userId.toString()}`).emit("campaign:update", failPayload);
+          WhatsAppService.io.emit("campaign:update", failPayload);
+          WhatsAppService.io.emit("group-broadcast:update", failPayload);
         }
       }
       activeJobs.delete(campaignId);
@@ -331,17 +469,15 @@ export async function startBroadcastCampaign(campaignId) {
 }
 
 /**
- * Pause a running Repeat Broadcast Campaign
+ * Pause a running Broadcast Campaign (both instant and repeat)
  * @param {string} campaignId
  */
 export async function pauseBroadcastCampaign(campaignId) {
   const timeoutId = activeJobs.get(campaignId);
   if (timeoutId && timeoutId !== "initializing") {
     clearTimeout(timeoutId);
-    activeJobs.delete(campaignId);
-  } else if (timeoutId === "initializing") {
-    activeJobs.delete(campaignId);
   }
+  activeJobs.delete(campaignId);
 
   const campaign = await GroupBroadcast.findById(campaignId);
   if (campaign) {
@@ -350,12 +486,16 @@ export async function pauseBroadcastCampaign(campaignId) {
 
     // Emit live paused update
     if (WhatsAppService.io) {
-      WhatsAppService.io.to(`user:${campaign.userId.toString()}`).emit("campaign:update", {
+      const pausePayload = {
         campaignId,
         status: "paused",
         stats: campaign.stats,
-        results: campaign.results
-      });
+        results: campaign.results,
+        currentSending: null
+      };
+      WhatsAppService.io.to(`user:${campaign.userId.toString()}`).emit("campaign:update", pausePayload);
+      WhatsAppService.io.emit("campaign:update", pausePayload);
+      WhatsAppService.io.emit("group-broadcast:update", pausePayload);
     }
   }
   return campaign;
