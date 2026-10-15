@@ -99,7 +99,7 @@ class GroupMemberTaskService {
       members: formattedMembers,
       delaySeconds: minDelay,
       delayMaxSeconds: maxDelay,
-      membersPerBatch: Math.max(1, Math.min(10, Number(membersPerBatch) || 2)),
+      membersPerBatch: Math.max(1, Math.min(100, Number(membersPerBatch) || 2)),
       batchSize: Math.max(1, Number(batchSize) || 10),
       batchCooldownSeconds: Math.max(5, Number(batchCooldownSeconds) || 25),
       rotationMode: rotationMode || "round-robin",
@@ -138,6 +138,142 @@ class GroupMemberTaskService {
     }
     const info = await WhatsAppService.getGroupInviteInfo(sessionId, cleanCode);
     return info;
+  }
+
+  /**
+   * Fetch all existing participants of a destination group (via groupJid or invite link)
+   * to remove/filter duplicates from queued lists.
+   */
+  async getGroupParticipants(userId, sessionId, { groupJid, inviteUrl, autoJoin = false }) {
+    let resolvedJid = groupJid || "";
+    let resolvedSubject = "";
+    let participants = [];
+
+    // Find a working socket
+    let sock = sessionId ? WhatsAppService.getSocket(sessionId) : null;
+    if (!sock || !WhatsAppService.isSessionWorking(sessionId)) {
+      if (sessionId) {
+        sock = await this.waitForSessionConnection(sessionId, 3000);
+      }
+      if (!sock || !sock?.user?.id) {
+        for (const [sId, s] of WhatsAppService.sockets.entries()) {
+          if (WhatsAppService.isSessionWorking(sId)) {
+            sock = s;
+            sessionId = sId;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!sock) {
+      throw new Error("No connected WhatsApp account available. Please connect or select an active account.");
+    }
+
+    // 1. If groupJid provided and valid, query metadata
+    if (resolvedJid && resolvedJid.includes("@")) {
+      try {
+        const metadata = await WhatsAppService.getGroupMetadata(sessionId, resolvedJid);
+        if (metadata) {
+          resolvedSubject = metadata.subject || "";
+          if (Array.isArray(metadata.participants)) {
+            for (const p of metadata.participants) {
+              const num = String(p.phoneNumber || p.id || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+              if (num && num.length >= 10) {
+                participants.push({
+                  phone: num,
+                  jid: p.id || `${num}@s.whatsapp.net`,
+                  isAdmin: p.admin === "admin" || p.admin === "superadmin",
+                });
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[getGroupParticipants] Error fetching metadata for ${resolvedJid}:`, err.message);
+      }
+    }
+
+    // 2. If inviteUrl or code is provided
+    if (inviteUrl) {
+      const code = WhatsAppService.extractGroupInviteCode(inviteUrl);
+      if (code) {
+        // If autoJoin was requested and account is not in group yet, join it
+        if (autoJoin) {
+          try {
+            console.log(`[getGroupParticipants] Joining group via invite code ${code} to fetch all participants...`);
+            const joinedGid = await WhatsAppService.joinGroupViaInvite(sessionId, code);
+            if (joinedGid) resolvedJid = joinedGid;
+          } catch (joinErr) {
+            console.warn(`[getGroupParticipants] Auto-join attempt notice:`, joinErr.message);
+          }
+        }
+
+        try {
+          const inviteInfo = await WhatsAppService.getGroupInviteInfo(sessionId, code);
+          if (inviteInfo) {
+            if (!resolvedJid && inviteInfo.id) resolvedJid = inviteInfo.id;
+            if (!resolvedSubject && inviteInfo.subject) resolvedSubject = inviteInfo.subject;
+            if (Array.isArray(inviteInfo.participants) && inviteInfo.participants.length > 0) {
+              for (const p of inviteInfo.participants) {
+                const num = String(p.phoneNumber || p.id || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+                if (num && num.length >= 10 && !participants.some((item) => item.phone === num)) {
+                  participants.push({
+                    phone: num,
+                    jid: p.id || `${num}@s.whatsapp.net`,
+                    isAdmin: p.admin === "admin" || p.admin === "superadmin",
+                  });
+                }
+              }
+            }
+          }
+        } catch (inviteErr) {
+          console.warn(`[getGroupParticipants] Error resolving invite info:`, inviteErr.message);
+        }
+
+        // If we have resolvedJid, try fetching full group metadata
+        if (resolvedJid && resolvedJid.includes("@")) {
+          try {
+            const fullMeta = await WhatsAppService.getGroupMetadata(sessionId, resolvedJid);
+            if (fullMeta?.participants && Array.isArray(fullMeta.participants)) {
+              const fullList = [];
+              for (const p of fullMeta.participants) {
+                const num = String(p.phoneNumber || p.id || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+                if (num && num.length >= 10) {
+                  fullList.push({
+                    phone: num,
+                    jid: p.id || `${num}@s.whatsapp.net`,
+                    isAdmin: p.admin === "admin" || p.admin === "superadmin",
+                  });
+                }
+              }
+              if (fullList.length > 0) {
+                participants = fullList;
+              }
+            }
+          } catch (metaErr) {
+            // ignore
+          }
+        }
+      }
+    }
+
+    // De-duplicate participants by phone
+    const seen = new Set();
+    const uniqueParticipants = [];
+    for (const p of participants) {
+      if (!seen.has(p.phone)) {
+        seen.add(p.phone);
+        uniqueParticipants.push(p);
+      }
+    }
+
+    return {
+      groupJid: resolvedJid,
+      subject: resolvedSubject || "Target WhatsApp Group",
+      count: uniqueParticipants.length,
+      participants: uniqueParticipants,
+    };
   }
 
   // Helper to ensure member report contains processedBy info for UI display
@@ -300,6 +436,67 @@ class GroupMemberTaskService {
     }
 
     return task;
+  }
+
+  /**
+   * Parse participant status returned by WhatsApp socket groupParticipantsUpdate.
+   * Matches by full JID, normalized phone digits, or domain-stripped phone.
+   */
+  parseParticipantResult(response, member) {
+    if (!response) return null;
+    const cleanPhone = String(member.phone || "").replace(/\D/g, "");
+
+    // Check if response is an array or has a participants array
+    const items = Array.isArray(response)
+      ? response
+      : (Array.isArray(response?.participants) ? response.participants : null);
+
+    if (items) {
+      for (const item of items) {
+        if (!item) continue;
+        const rawJid = String(item.jid || item.id || "");
+        const rawPhone = rawJid.split("@")[0].split(":")[0].replace(/\D/g, "");
+        if (
+          rawJid === member.jid ||
+          (rawPhone && (rawPhone === cleanPhone || (cleanPhone.length >= 10 && rawPhone.endsWith(cleanPhone.slice(-10)))))
+        ) {
+          const rawStatus = item.status !== undefined ? item.status : item.code;
+          return {
+            status: rawStatus !== undefined && rawStatus !== null ? String(rawStatus) : "unknown",
+            message: item.message || item.error || "",
+            data: item,
+          };
+        }
+      }
+      return null;
+    }
+
+    // Check if response is a keyed object
+    if (typeof response === "object") {
+      for (const [key, val] of Object.entries(response)) {
+        const rawPhone = String(key).split("@")[0].split(":")[0].replace(/\D/g, "");
+        if (
+          key === member.jid ||
+          (rawPhone && (rawPhone === cleanPhone || (cleanPhone.length >= 10 && rawPhone.endsWith(cleanPhone.slice(-10)))))
+        ) {
+          if (typeof val === "object" && val !== null) {
+            const rawStatus = val.status !== undefined ? val.status : val.code;
+            return {
+              status: rawStatus !== undefined && rawStatus !== null ? String(rawStatus) : "unknown",
+              message: val.message || val.error || "",
+              data: val,
+            };
+          }
+          return {
+            status: String(val),
+            message: "",
+            data: val,
+          };
+        }
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -483,7 +680,30 @@ class GroupMemberTaskService {
         break;
       }
 
-      const batchLimit = Math.max(1, Math.min(10, Number(task.membersPerBatch) || 2));
+      // Pre-cache existing group participants to accurately auto-skip duplicates
+      if (!cachedExistingParticipants && task.targetGroup?.jid) {
+        for (const s of task.addingSessions || []) {
+          try {
+            const meta = await WhatsAppService.getGroupMetadata(s.sessionId, task.targetGroup.jid);
+            if (meta?.participants && Array.isArray(meta.participants)) {
+              cachedExistingParticipants = new Set();
+              for (const p of meta.participants) {
+                const pPhone = String(p.phoneNumber || p.id || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+                if (pPhone) {
+                  cachedExistingParticipants.add(pPhone);
+                  if (pPhone.length > 10) cachedExistingParticipants.add(pPhone.slice(-10));
+                }
+              }
+              console.log(`[GroupMemberTask] Cached ${cachedExistingParticipants.size / 2} existing group participants.`);
+              break;
+            }
+          } catch (metaErr) {
+            // Can be resolved as accounts connect
+          }
+        }
+      }
+
+      const batchLimit = Math.max(1, Math.min(100, Number(task.membersPerBatch) || 2));
       const pendingMembers = [];
 
       for (const m of task.members) {
@@ -499,8 +719,6 @@ class GroupMemberTaskService {
             m.status = "added";
             m.addedAt = new Date();
             m.error = "Already in group (auto-skipped).";
-            task.stats.added++;
-            task.stats.pending--;
             continue;
           }
 
@@ -512,9 +730,17 @@ class GroupMemberTaskService {
       }
 
       if (pendingMembers.length === 0) {
+        // Sync stats before completing
+        task.stats.added = task.members.filter((m) => m.status === "added").length;
+        task.stats.invited = task.members.filter((m) => m.status === "invited").length;
+        task.stats.failed = task.members.filter((m) => m.status === "failed").length;
+        task.stats.pending = task.members.filter((m) => m.status === "pending").length;
+        task.stats.total = task.members.length;
+
         const anyRemaining = task.members.some((m) => m.status === "pending");
         if (!anyRemaining) {
           task.status = "completed";
+          task.lastError = "";
           await task.save();
           this.activeTasks.delete(String(taskId));
           console.log(`[GroupMemberTask] Task ${taskId} completed successfully!`);
@@ -525,9 +751,47 @@ class GroupMemberTaskService {
       }
 
       const addingSessions = task.addingSessions || [];
+      if (addingSessions.length === 0) {
+        task.status = "paused";
+        task.lastError = "No WhatsApp accounts assigned to this task.";
+        await task.save();
+        this.activeTasks.delete(String(taskId));
+        break;
+      }
+
+      // Check account connection status: Ensure at least one account is active/reachable
+      let reachableAccountFound = false;
+      for (const s of addingSessions) {
+        if (WhatsAppService.isSessionWorking(s.sessionId)) {
+          reachableAccountFound = true;
+          break;
+        }
+      }
+
+      // If no session working in memory, attempt quick connection
+      if (!reachableAccountFound) {
+        for (const s of addingSessions) {
+          const testSock = await this.waitForSessionConnection(s.sessionId, 2500, () => controlState.abort);
+          if (testSock && testSock?.user?.id) {
+            reachableAccountFound = true;
+            break;
+          }
+        }
+      }
+
+      // If ALL accounts are disconnected, PAUSE the task immediately to protect pending queue
+      if (!reachableAccountFound) {
+        console.warn(`[GroupMemberTask] All assigned accounts for task ${taskId} are disconnected. Pausing task.`);
+        task.status = "paused";
+        task.lastError = "All assigned WhatsApp accounts are disconnected. Task paused automatically to protect your member queue. Please reconnect or scan your account in WhatsApp Accounts, then click Resume.";
+        await task.save();
+        this.activeTasks.delete(String(taskId));
+        break;
+      }
+
       const rotationMode = task.rotationMode || "round-robin";
 
-      // 1. Determine primary account rotation for this batch
+      // Determine primary account rotation for this batch
       let primaryIdx = 0;
       if (rotationMode === "batch-switch") {
         const batchSz = Math.max(1, task.batchSize || 10);
@@ -543,8 +807,9 @@ class GroupMemberTaskService {
 
       let unresolvedMembers = [...pendingMembers];
       let memberErrors = new Map();
+      let attemptedAccountsCount = 0;
 
-      // Multi-Account Failover Loop: Try adding the batch with primary account, and fallback to other accounts for any failed numbers
+      // Multi-Account Failover Loop: Try adding the batch with primary account, fallback to other accounts for restricted numbers
       for (let attempt = 0; attempt < orderedCandidateSessions.length; attempt++) {
         if (controlState.abort || unresolvedMembers.length === 0) break;
         const candidate = orderedCandidateSessions[attempt];
@@ -552,9 +817,11 @@ class GroupMemberTaskService {
 
         const sock = await this.waitForSessionConnection(sId, 2500, () => controlState.abort);
         if (!sock || !sock?.user?.id) {
+          console.warn(`[GroupMemberTask] Account ${candidate.name || sId} is not connected. Skipping to next account...`);
           continue;
         }
 
+        attemptedAccountsCount++;
         const activePhone = (sock.user?.id || "").split("@")[0].split(":")[0];
         const sName = candidate.name || "WhatsApp Account";
         const batchJids = unresolvedMembers.map((m) => m.jid);
@@ -562,7 +829,7 @@ class GroupMemberTaskService {
 
         try {
           console.log(
-            `[GroupMemberTask] Batch adding [${phonesList}] (${unresolvedMembers.length} numbers) directly to ${task.targetGroup.jid} via account ${sName} (+${activePhone}) [Candidate ${attempt + 1}/${orderedCandidateSessions.length}]`
+            `[GroupMemberTask] Batch adding [${phonesList}] (${unresolvedMembers.length} numbers) to ${task.targetGroup.jid} via ${sName} (+${activePhone}) [Candidate ${attempt + 1}/${orderedCandidateSessions.length}]`
           );
 
           await GroupMemberTask.findByIdAndUpdate(taskId, {
@@ -575,20 +842,16 @@ class GroupMemberTaskService {
             "add"
           );
 
+          console.log(`[GroupMemberTask] Raw WhatsApp response:`, JSON.stringify(response || []));
+
           const newlyResolved = [];
 
           for (const m of unresolvedMembers) {
-            let resData = null;
-            if (response && typeof response === "object") {
-              resData =
-                response[m.jid] ||
-                (Array.isArray(response)
-                  ? response.find((r) => r.jid === m.jid || r.id === m.jid)
-                  : null);
-            }
-            const statusCode = String(resData?.status || resData?.code || (response ? "200" : "500"));
+            const parsed = this.parseParticipantResult(response, m);
+            const statusCode = String(parsed?.status || "unknown");
 
-            if (statusCode === "200" || statusCode === "207" || statusCode === "409") {
+            if (statusCode === "200" || statusCode === "207") {
+              // Successfully added directly to group
               m.status = "added";
               m.addedAt = new Date();
               m.error = "";
@@ -596,8 +859,22 @@ class GroupMemberTaskService {
               m.processedBySessionId = sId;
               m.processedByName = sName;
               m.processedByPhoneNumber = activePhone;
-              task.stats.added++;
-              task.stats.pending--;
+              newlyResolved.push(m);
+
+              const cPhone = String(m.phone).replace(/\D/g, "");
+              if (cachedExistingParticipants) {
+                cachedExistingParticipants.add(cPhone);
+                if (cPhone.length > 10) cachedExistingParticipants.add(cPhone.slice(-10));
+              }
+            } else if (statusCode === "409") {
+              // Already a member of the group
+              m.status = "added";
+              m.addedAt = new Date();
+              m.error = "Already in group (status 409)";
+              m.assignedSessionId = sId;
+              m.processedBySessionId = sId;
+              m.processedByName = sName;
+              m.processedByPhoneNumber = activePhone;
               newlyResolved.push(m);
 
               const cPhone = String(m.phone).replace(/\D/g, "");
@@ -606,10 +883,28 @@ class GroupMemberTaskService {
                 if (cPhone.length > 10) cachedExistingParticipants.add(cPhone.slice(-10));
               }
             } else if (statusCode === "403" || statusCode === "408") {
-              memberErrors.set(m.jid, "Direct add restricted by WhatsApp (Account is not group admin or contact's privacy settings restrict group additions).");
-              console.warn(`[GroupMemberTask] Account ${sName} received status ${statusCode} for +${m.phone}. Retrying with next account...`);
+              // Direct add restricted by privacy settings or requires invite code
+              memberErrors.set(
+                m.jid,
+                "Privacy settings restrict direct group addition (Contact only allows contacts or invite links)."
+              );
+              console.warn(`[GroupMemberTask] Account ${sName} received privacy restriction (status ${statusCode}) for +${m.phone}`);
+            } else if (statusCode === "401") {
+              // Sender account is not group admin
+              memberErrors.set(
+                m.jid,
+                `Sender account ${sName} is not a group admin or unauthorized to add members.`
+              );
+              console.warn(`[GroupMemberTask] Account ${sName} is not group admin (status 401).`);
+            } else if (statusCode === "404") {
+              memberErrors.set(m.jid, "Phone number is not registered on WhatsApp (Status 404).");
+            } else if (statusCode === "429") {
+              memberErrors.set(m.jid, `WhatsApp temporary rate-limit triggered for account ${sName}.`);
             } else {
-              memberErrors.set(m.jid, resData?.message || `WhatsApp status code ${statusCode}`);
+              memberErrors.set(
+                m.jid,
+                parsed?.message || (statusCode !== "unknown" ? `WhatsApp status code ${statusCode}` : "No confirmation received from WhatsApp for this number.")
+              );
             }
           }
 
@@ -617,14 +912,24 @@ class GroupMemberTaskService {
         } catch (batchErr) {
           console.warn(`[GroupMemberTask] Batch add attempt failed for account ${sName}:`, batchErr.message);
           for (const m of unresolvedMembers) {
-            memberErrors.set(m.jid, batchErr.message || "Direct addition error.");
+            memberErrors.set(m.jid, `Request failed via account ${sName}: ${batchErr.message || "Connection error"}`);
           }
           continue;
         }
       }
 
-      // Handle any members that could not be added across all candidate accounts
+      // Handle any members that could not be added directly across all candidate accounts
       if (unresolvedMembers.length > 0) {
+        // If not a single account could even be attempted because all disconnected during loop:
+        if (attemptedAccountsCount === 0) {
+          console.warn(`[GroupMemberTask] No accounts reachable for batch in task ${taskId}. Pausing task.`);
+          task.status = "paused";
+          task.lastError = "Assigned WhatsApp accounts became disconnected during execution. Task paused to protect member queue.";
+          await task.save();
+          this.activeTasks.delete(String(taskId));
+          break;
+        }
+
         const fallbackSession = orderedCandidateSessions[0] || addingSessions[0];
         for (const m of unresolvedMembers) {
           m.assignedSessionId = fallbackSession?.sessionId || m.assignedSessionId;
@@ -644,21 +949,28 @@ class GroupMemberTaskService {
                 sentInvite = true;
                 m.status = "invited";
                 m.addedAt = new Date();
-                m.error = "Direct add restricted. Group invite link sent via DM.";
-                task.stats.invited++;
-                task.stats.pending--;
+                m.error = "Privacy restricted: Group invite link sent via DM.";
               }
-            } catch (e) {}
+            } catch (e) {
+              console.warn(`[GroupMemberTask] Failed to send invite DM to +${m.phone}:`, e.message);
+            }
           }
 
           if (!sentInvite) {
             m.status = "failed";
-            m.error = memberErrors.get(m.jid) || "Direct add restricted by WhatsApp (Account is not group admin or contact's privacy settings restrict group additions).";
-            task.stats.failed++;
-            task.stats.pending--;
+            m.error =
+              memberErrors.get(m.jid) ||
+              "Direct add restricted by WhatsApp (Contact's privacy settings restrict group additions or account is not admin).";
           }
         }
       }
+
+      // Recompute stats directly from task.members to ensure 100% precision
+      task.stats.added = task.members.filter((m) => m.status === "added").length;
+      task.stats.invited = task.members.filter((m) => m.status === "invited").length;
+      task.stats.failed = task.members.filter((m) => m.status === "failed").length;
+      task.stats.pending = task.members.filter((m) => m.status === "pending").length;
+      task.stats.total = task.members.length;
 
       await task.save();
       loopCounter++;

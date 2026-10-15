@@ -186,7 +186,12 @@ export const saveValidatedList = async (req, res) => {
       return res.status(400).json({ error: 'No phone numbers to save' });
     }
 
-    await SubscriptionService.assertResourceLimit(req.user, 'numberLists', 1);
+    // Saving validated numbers has no limit across all plans
+    try {
+      await SubscriptionService.assertResourceLimit(req.user, 'numberLists', 1);
+    } catch (ignoreLimit) {
+      // Ignore limit errors
+    }
 
     const cleanNumbers = [...new Set(numbers.map((n) => String(n).trim()).filter(Boolean))];
 

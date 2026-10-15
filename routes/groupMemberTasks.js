@@ -8,6 +8,7 @@ router.use(authMiddleware);
 
 router.post("/", groupMemberTaskController.createTask);
 router.post("/resolve-invite", groupMemberTaskController.resolveInvite);
+router.post("/get-group-participants", groupMemberTaskController.getGroupParticipants);
 router.get("/", groupMemberTaskController.listTasks);
 router.get("/:id", groupMemberTaskController.getTask);
 router.post("/:id/start", groupMemberTaskController.startTask);

@@ -64,7 +64,11 @@ export const getPublicPlans = async (req, res) => {
       durationDays: p.durationDays || 30,
       isDemo: !!p.isDemo,
       sortOrder: p.sortOrder || 100,
-      limits: p.limits || {},
+      limits: {
+        ...(p.limits || {}),
+        sessions: -1,
+        numberLists: -1,
+      },
       features: (p.features || []).filter((f) => f.enabled !== false),
     }));
 

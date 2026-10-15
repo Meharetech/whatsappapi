@@ -523,14 +523,14 @@ class ValidatorTaskService {
     const uniqueNumbers = [...new Set(validPhones)];
     const listTitle = (customListName || '').trim() || `${task.name} (Verified)`;
 
-    // Check subscription limits
-    const userDoc = await (await import('../models/User.js')).default.findById(userId);
-    if (userDoc) {
-      if (typeof SubscriptionService.assertContactsLimit === 'function') {
+    // Validated numbers saving is unlimited across all plans
+    try {
+      const userDoc = await (await import('../models/User.js')).default.findById(userId);
+      if (userDoc && typeof SubscriptionService.assertContactsLimit === 'function') {
         await SubscriptionService.assertContactsLimit(userDoc, uniqueNumbers.length);
-      } else {
-        await SubscriptionService.assertResourceLimit(userDoc, 'numberLists', 1);
       }
+    } catch (e) {
+      // Ignore limit errors - saving validated numbers has no limit
     }
 
     const newList = new NumberList({

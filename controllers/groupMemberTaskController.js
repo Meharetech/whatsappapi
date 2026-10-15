@@ -87,6 +87,21 @@ export const resolveInvite = async (req, res) => {
   }
 };
 
+export const getGroupParticipants = async (req, res) => {
+  try {
+    const { sessionId, groupJid, inviteUrl, autoJoin } = req.body;
+    const result = await GroupMemberTaskService.getGroupParticipants(req.user._id, sessionId, {
+      groupJid,
+      inviteUrl,
+      autoJoin: Boolean(autoJoin),
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    console.error("getGroupParticipants error:", err);
+    res.status(400).json({ success: false, error: err.message });
+  }
+};
+
 export default {
   createTask,
   listTasks,
@@ -96,5 +111,6 @@ export default {
   resetFailedTask,
   deleteTask,
   resolveInvite,
+  getGroupParticipants,
 };
 

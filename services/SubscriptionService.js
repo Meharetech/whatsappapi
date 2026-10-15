@@ -30,7 +30,7 @@ const DEFAULT_PLANS = [
     limits: {
       sessions: -1,
       campaigns: 2,
-      numberLists: 2,
+      numberLists: -1,
       storageMb: 200,
       messagesDaily: 50,
       messagesWeekly: 200,
@@ -49,7 +49,7 @@ const DEFAULT_PLANS = [
     limits: {
       sessions: -1,
       campaigns: 10,
-      numberLists: 10,
+      numberLists: -1,
       storageMb: 300,
       messagesDaily: 300,
       messagesWeekly: 1500,
@@ -68,7 +68,7 @@ const DEFAULT_PLANS = [
     limits: {
       sessions: -1,
       campaigns: 40,
-      numberLists: 50,
+      numberLists: -1,
       storageMb: 1024,
       messagesDaily: 2000,
       messagesWeekly: 10000,
@@ -152,7 +152,7 @@ class SubscriptionService {
       );
     }
 
-    await SubscriptionPlan.updateMany({}, { $set: { "limits.sessions": -1 } });
+    await SubscriptionPlan.updateMany({}, { $set: { "limits.sessions": -1, "limits.numberLists": -1 } });
 
     const demoPlan = await SubscriptionPlan.findOne({ slug: "demo" });
     const settings = await SubscriptionSettings.findOneAndUpdate(
@@ -360,7 +360,11 @@ class SubscriptionService {
         durationDays: plan.durationDays,
         priceMonthly: plan.priceMonthly,
         priceYearly: plan.priceYearly,
-        limits: plan.limits,
+        limits: {
+          ...(plan.limits || {}),
+          sessions: -1,
+          numberLists: -1,
+        },
         features: plan.features,
       },
       subscription: {
@@ -443,6 +447,7 @@ class SubscriptionService {
   }
 
   getLimitValue(plan, key) {
+    if (key === "numberLists" || key === "sessions") return -1;
     return Number(plan?.limits?.[key]);
   }
 
@@ -461,7 +466,7 @@ class SubscriptionService {
       });
     }
 
-    if (resourceKey === "sessions") {
+    if (resourceKey === "sessions" || resourceKey === "numberLists") {
       return summary;
     }
 
@@ -511,7 +516,7 @@ class SubscriptionService {
   }
 
   async assertContactsLimit(user, count = 1) {
-    return this.assertResourceLimit(user, "numberLists", 1);
+    return { unlimited: true };
   }
 
   async assertStorageLimit(user, incomingBytes = 0) {
@@ -697,7 +702,11 @@ class SubscriptionService {
       isCustom: plan.isCustom,
       assignToRoles: plan.assignToRoles || [],
       assignToLocations: plan.assignToLocations || [],
-      limits: plan.limits,
+      limits: {
+        ...(plan.limits || {}),
+        sessions: -1,
+        numberLists: -1,
+      },
       features: plan.features || [],
       sortOrder: plan.sortOrder,
       createdAt: plan.createdAt,

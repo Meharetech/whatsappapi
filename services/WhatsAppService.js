@@ -2895,16 +2895,26 @@ class WhatsAppService {
     try {
       const info = await sock.groupGetInviteInfo(code);
       const jid = info.id ? (info.id.includes("@") ? info.id : `${info.id}@g.us`) : "";
+      let participants = Array.isArray(info.participants) ? info.participants : [];
+      if (jid) {
+        try {
+          const fullMeta = await sock.groupMetadata(jid);
+          if (fullMeta && Array.isArray(fullMeta.participants) && fullMeta.participants.length > 0) {
+            participants = fullMeta.participants;
+          }
+        } catch (e) {}
+      }
       return {
         id: jid,
         subject: info.subject || "WhatsApp Group",
-        size: info.size || 0,
+        size: info.size || participants.length || 0,
         creation: info.creation,
         owner: info.owner,
         desc: info.desc,
         inviteCode: code,
         inviteUrl: `https://chat.whatsapp.com/${code}`,
         code,
+        participants,
       };
     } catch (err) {
       console.error(`[WA GROUPS] Failed to resolve group invite info for ${code}:`, err.message);
